@@ -184,7 +184,8 @@ struct ContentView: View {
             }
         }
 
-        voice.onPCMChunk = { data in
+        // @Sendable so the audio thread can invoke this without MainActor isolation traps.
+        voice.onPCMChunk = { @Sendable data in
             Task { @MainActor in
                 guard realtimeLive, worker.ready else { return }
                 try? worker.sendUnordered(

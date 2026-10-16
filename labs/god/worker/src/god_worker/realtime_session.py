@@ -121,10 +121,7 @@ class RealtimeSession:
         self.cancel.clear()
         self._thread = threading.Thread(target=self._run, name="god-realtime", daemon=True)
         self._thread.start()
-        self._mouse_thread = threading.Thread(
-            target=self._mouse_watch, name="god-mouse-watch", daemon=True
-        )
-        self._mouse_thread.start()
+        # Mouse watch starts only after the WebSocket is up (see _run).
 
     def stop(self) -> None:
         self._stop.set()
@@ -163,7 +160,7 @@ class RealtimeSession:
         with self._conn_lock:
             conn = self._connection
         if conn is None:
-            raise RuntimeError("Realtime session is not connected.")
+            return  # Not connected yet / already closed — ignore (e.g. early mouse notice).
         conn.conversation.item.create(
             item={
                 "type": "message",
@@ -202,6 +199,11 @@ class RealtimeSession:
                 connection.session.update(
                     session=session_config(self.policy, self.model, self.voice)
                 )
+                if self._mouse_thread is None or not self._mouse_thread.is_alive():
+                    self._mouse_thread = threading.Thread(
+                        target=self._mouse_watch, name="god-mouse-watch", daemon=True
+                    )
+                    self._mouse_thread.start()
                 self.emit(
                     {
                         "type": "agent_event",

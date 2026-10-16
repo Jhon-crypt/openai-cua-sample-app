@@ -24,20 +24,20 @@ enum VoiceCaptureError: LocalizedError {
     }
 }
 
-/// Holds tap state off the main actor — AVAudioEngine taps run on a realtime audio thread
-/// and must not touch `@MainActor` objects (Swift traps with `_dispatch_assert_queue_fail`).
+/// Audio-thread–safe PCM convert + deliver. Must never touch MainActor types.
 private final class PCMStreamCore: @unchecked Sendable {
     let converter: AVAudioConverter
     let targetFormat: AVAudioFormat
     let inputSampleRate: Double
     private let lock = NSLock()
-    private var onChunk: ((Data) -> Void)?
+    /// Delivered on a background queue (never the AVAudio realtime thread).
+    private var onChunk: (@Sendable (Data) -> Void)?
 
     init(
         converter: AVAudioConverter,
         targetFormat: AVAudioFormat,
         inputSampleRate: Double,
-        onChunk: ((Data) -> Void)?
+        onChunk: (@Sendable (Data) -> Void)?
     ) {
         self.converter = converter
         self.targetFormat = targetFormat
@@ -45,13 +45,27 @@ private final class PCMStreamCore: @unchecked Sendable {
         self.onChunk = onChunk
     }
 
-    func setOnChunk(_ handler: ((Data) -> Void)?) {
+    func setOnChunk(_ handler: (@Sendable (Data) -> Void)?) {
         lock.lock()
         onChunk = handler
         lock.unlock()
     }
 
-    func handle(_ buffer: AVAudioPCMBuffer) {
+    /// Install the tap from a nonisolated context so the block is not MainActor-isolated.
+    /// Closures created inside `@MainActor` methods inherit MainActor isolation; AVAudio
+    /// then traps when it invokes them on its realtime queue (`_dispatch_assert_queue_fail`).
+    nonisolated static func installTap(
+        on input: AVAudioInputNode,
+        bufferSize: AVAudioFrameCount,
+        format: AVAudioFormat,
+        core: PCMStreamCore
+    ) {
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: format) { buffer, _ in
+            core.process(buffer)
+        }
+    }
+
+    nonisolated func process(_ buffer: AVAudioPCMBuffer) {
         let ratio = targetFormat.sampleRate / inputSampleRate
         let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
         guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
@@ -77,7 +91,11 @@ private final class PCMStreamCore: @unchecked Sendable {
         lock.lock()
         let handler = onChunk
         lock.unlock()
-        handler?(data)
+        guard let handler else { return }
+        // Leave the realtime audio thread before any Swift concurrency work.
+        DispatchQueue.global(qos: .userInitiated).async {
+            handler(data)
+        }
     }
 }
 
@@ -90,9 +108,8 @@ final class VoiceCapture: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isStreaming = false
 
-    /// Invoked from the audio thread with raw pcm16 mono @ 24 kHz chunks.
-    /// Handler must hop to the main actor before touching UI / WorkerClient.
-    var onPCMChunk: ((Data) -> Void)? {
+    /// Must be `@Sendable`. Called off the main actor; hop with `Task { @MainActor in … }` if needed.
+    var onPCMChunk: (@Sendable (Data) -> Void)? {
         didSet { streamCore?.setOnChunk(onPCMChunk) }
     }
 
@@ -191,11 +208,7 @@ final class VoiceCapture: ObservableObject {
         streamCore = core
         self.engine = engine
 
-        let bufferSize: AVAudioFrameCount = 2_400
-        // Capture only the nonisolated core — never `self` (MainActor).
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { buffer, _ in
-            core.handle(buffer)
-        }
+        PCMStreamCore.installTap(on: input, bufferSize: 2_400, format: inputFormat, core: core)
 
         do {
             try engine.start()
