@@ -19,9 +19,15 @@ export function launchConfiguration(backend, production = false, env = process.e
   if (!["javascript", "python"].includes(backend)) throw new Error("Choose pnpm dev:js or pnpm dev:python.");
   const port = Number(env.PORT ?? (backend === "python" ? 4041 : 4001));
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("PORT must be an integer between 1 and 65535.");
+  const consolePort = Number(env.CONSOLE_PORT ?? 3000);
+  if (!Number.isInteger(consolePort) || consolePort < 1 || consolePort > 65535) {
+    throw new Error("CONSOLE_PORT must be an integer between 1 and 65535.");
+  }
   const host = env.HOST ?? "127.0.0.1";
   const connectHost = host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "[::1]" : host.includes(":") ? `[${host.replace(/^\[|\]$/g, "")}]` : host;
   const runnerBaseUrl = env.RUNNER_BASE_URL ?? `http://${connectHost}:${port}`;
+  const consoleOrigin = `http://127.0.0.1:${consolePort}`;
+  const allowedOrigins = [env.CUA_ALLOWED_ORIGINS, consoleOrigin].filter(Boolean).join(",");
   const python = join(root, "python-app", ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
   return {
     backend,
@@ -30,7 +36,16 @@ export function launchConfiguration(backend, production = false, env = process.e
       ? [...(production ? [] : ["--import", "tsx"]), join(root, "javascript-app", production ? "dist/index.js" : "src/index.ts")]
       : ["-m", "app"],
     runnerBaseUrl,
-    env: { ...env, HOST: host, PORT: String(port), CUA_BACKEND: backend, RUNNER_BASE_URL: runnerBaseUrl },
+    consolePort,
+    env: {
+      ...env,
+      HOST: host,
+      PORT: String(port),
+      CONSOLE_PORT: String(consolePort),
+      CUA_BACKEND: backend,
+      RUNNER_BASE_URL: runnerBaseUrl,
+      CUA_ALLOWED_ORIGINS: allowedOrigins,
+    },
     consoleCommand: production ? "start" : "dev",
   };
 }
@@ -57,7 +72,7 @@ async function preflightLaunchPorts(config) {
   // still protect against another launch winning a race after the probes close.
   await assertPortAvailable("127.0.0.1", 4050, "Backend coordination");
   await assertPortAvailable(config.env.HOST, Number(config.env.PORT), "Backend");
-  await assertPortAvailable("127.0.0.1", 3000, "Console");
+  await assertPortAvailable("127.0.0.1", config.consolePort, "Console");
 }
 
 export async function waitForBackend(baseUrl, backend, { signal, isAlive = () => true, timeoutMs = 30_000, instanceId } = {}) {
@@ -149,8 +164,9 @@ async function main() {
     });
     const consoleEnv = { ...config.env };
     delete consoleEnv.OPENAI_API_KEY;
+    console.log(`Console: http://127.0.0.1:${config.consolePort}`);
     const consoleApp = start(process.execPath,
-      [join(root, "console/node_modules/next/dist/bin/next"), config.consoleCommand, "--hostname", "127.0.0.1", "--port", "3000"],
+      [join(root, "console/node_modules/next/dist/bin/next"), config.consoleCommand, "--hostname", "127.0.0.1", "--port", String(config.consolePort)],
       join(root, "console"), consoleEnv);
     const result = await Promise.race([runner.done, consoleApp.done]);
     if (!controller.signal.aborted && result.code !== 0) throw result.error ?? new Error("A service exited unexpectedly; stopping the selected app.");

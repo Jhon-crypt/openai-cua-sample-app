@@ -12,12 +12,18 @@ test("launch choice selects exactly one runner and one console identity", () => 
   const py = launchConfiguration("python", true, {});
   assert.equal(js.env.CUA_BACKEND, "javascript");
   assert.equal(js.runnerBaseUrl, "http://127.0.0.1:4001");
+  assert.equal(js.consolePort, 3000);
+  assert.match(js.env.CUA_ALLOWED_ORIGINS, /http:\/\/127\.0\.0\.1:3000/);
   assert.equal(py.env.CUA_BACKEND, "python");
   assert.equal(py.runnerBaseUrl, "http://127.0.0.1:4041");
   assert.deepEqual(py.args, ["-m", "app"]);
   assert.equal(py.consoleCommand, "start");
+  const custom = launchConfiguration("javascript", false, { CONSOLE_PORT: "3001" });
+  assert.equal(custom.consolePort, 3001);
+  assert.match(custom.env.CUA_ALLOWED_ORIGINS, /http:\/\/127\.0\.0\.1:3001/);
   assert.throws(() => launchConfiguration("all"), /Choose/);
   assert.throws(() => launchConfiguration("python", false, { PORT: "0" }), /PORT/);
+  assert.throws(() => launchConfiguration("javascript", false, { CONSOLE_PORT: "0" }), /CONSOLE_PORT/);
 });
 
 test("port preflight reports the occupied address without disturbing its listener", async () => {
