@@ -2,15 +2,23 @@
 
 ## Objective
 
-God converses with full-duplex voice via the OpenAI Realtime API, performs desktop tasks mid-conversation (`exec_py`), keeps session memory, and pauses with a spoken prompt when the operator moves the mouse.
+God converses with full-duplex voice via the OpenAI Realtime API, operates **any** macOS app with structured GUI tools (visible mouse), keeps a plan + compacted tool context, pauses on human mouse move, and stops when stuck repeating failures.
 
 ## Approach
 
-- Worker owns a WebSocket Realtime session (`gpt-realtime-2.1` by default, override `GOD_REALTIME_MODEL`).
-- HUD streams 24 kHz PCM mic audio; plays 24 kHz PCM agent audio.
-- Tools: same `exec_py` surface as the Responses loop.
-- Memory: Realtime conversation items (server-side for the session lifetime).
-- Mouse interrupt: poll cursor; if movement is not from our PyAutoGUI moves, inject a system notice and ask the operator to say when to continue.
+Harness components (inspired by Fan et al. arXiv:2609.20804):
+
+| Component | Implementation |
+|-----------|----------------|
+| Action space | `open_app`, `screenshot`, `click`, `type_text`, `hotkey`, `update_plan`, plus `exec_py` escape |
+| Planning | `update_plan` + plan injected into session instructions |
+| Context | Local T4-style elision of bulky tool results + running summary injected into instructions |
+| Verify | Auto-screenshot after open/click/type/hotkey; attach compact PNG to conversation when possible |
+| Stuck | Identical failing tool streaks → remind, then freeze actions |
+| Mouse | Slow visible moves + HUD red ring; human move → spoken pause |
+
+- Worker owns WebSocket Realtime (`gpt-realtime-2.1`, override `GOD_REALTIME_MODEL`).
+- HUD streams 24 kHz PCM mic; plays 24 kHz PCM agent audio (mic upload paused while God speaks).
 
 ## Protocol
 
@@ -21,23 +29,16 @@ God converses with full-duplex voice via the OpenAI Realtime API, performs deskt
 {"type":"realtime_stop","id":"4"}
 ```
 
-Events:
-
-```json
-{"type":"speak","audio_base64":"...","format":"pcm16","sample_rate":24000,"stream":true}
-{"type":"realtime_interrupt","reason":"mouse"|"speech"}
-{"type":"agent_event","level":"info","message":"..."}
-{"type":"usage", ...}
-```
-
 ## Success Criteria
 
 - Start Session opens Realtime; God greets by voice
-- Operator can talk continuously; God replies by voice and can run `exec_py`
-- Moving the mouse (by the human) triggers a spoken pause + continue prompt
-- Conversation context persists for the open session
-- Stop / ⌘⇧. tears down the Realtime socket and releases input
+- Structured tools can open any named app and click/type with a visible cursor
+- Multi-step goals use `update_plan`
+- Human mouse move triggers spoken pause + continue
+- Repeated identical failures trigger stuck reminder then freeze
+- Stop / ⌘⇧. tears down the socket and releases input
 
 ## Sources
 
 - https://platform.openai.com/docs/guides/realtime-conversations
+- https://arxiv.org/abs/2609.20804

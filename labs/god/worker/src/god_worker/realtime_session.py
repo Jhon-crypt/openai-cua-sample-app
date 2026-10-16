@@ -1,4 +1,4 @@
-"""OpenAI Realtime API session — duplex voice, tools, memory, mouse interrupt."""
+"""OpenAI Realtime API session — duplex voice, GUI tools, plan, context, stuck, mouse interrupt."""
 
 from __future__ import annotations
 
@@ -8,7 +8,14 @@ import threading
 import time
 from typing import Any, Callable
 
-from god_worker.agent_loop import build_code_tool_definitions, execute_code
+from god_worker.context_manager import ContextManager
+from god_worker.gui_tools import (
+    DesktopHarness,
+    build_gui_tool_definitions,
+    extract_verify_image,
+    tool_result_for_model,
+)
+from god_worker.stuck import StuckDetector
 
 Emit = Callable[[dict[str, Any]], None]
 
@@ -18,42 +25,39 @@ MOUSE_INTERRUPT_COOLDOWN_S = 5.0
 MOUSE_POLL_S = 0.08
 
 
-def build_instructions(policy: str) -> str:
+def build_instructions(policy: str, plan: str = "") -> str:
+    plan_block = plan.strip() or "(no plan yet — call update_plan for multi-step goals)"
     return "\n".join(
         [
             "You are God, a personal macOS desktop operator in a live voice conversation.",
             "Speak briefly and naturally. Remember everything said in this session.",
-            "You can operate ANY macOS application the operator names (Safari, Slack, Notes,",
-            "Finder, Terminal, Chrome, Mail, Calendar, Xcode, etc.) — not just one app.",
-            "When asked to act, call exec_py with PyAutoGUI.",
-            "To launch or focus an app, always use open_app('ExactAppName') — never Spotlight.",
-            "Workflow: open_app → short sleep → display(pyautogui.screenshot()) → click/type only",
-            "when the target UI is visible. Prefer moveTo before click so the cursor is visible.",
-            "Mouse moves are intentionally slow so the operator can watch them.",
-            "If you are told the operator moved the mouse, pause desktop work immediately,",
-            "say: 'Seems you moved your mouse — tell me when to continue with what you're doing.',",
-            "and wait until they say continue (or give a new instruction) before acting again.",
-            "Obey the operator policy exactly when present.",
+            "You can operate ANY macOS application (Safari, Slack, Notes, Finder, Terminal,",
+            "Chrome, Mail, Calendar, Xcode, etc.).",
+            "Prefer structured tools: open_app, screenshot, click, type_text, hotkey, update_plan.",
+            "Use exec_py only for unusual automation that those tools cannot do.",
+            "Never use Spotlight. Always open_app('ExactAppName').",
+            "Workflow: update_plan → open_app → screenshot → click/type → trust auto-verify screenshots.",
+            "Mouse moves are slow so the operator can watch the red cursor ring.",
+            "If told the operator moved the mouse, pause desktop work and say:",
+            "'Seems you moved your mouse — tell me when to continue with what you're doing.'",
+            "Wait for continue (or a new instruction) before acting again.",
+            "If stuck-detection says to change approach, do not repeat the same failing click.",
+            f"Current plan:\n{plan_block}",
             f"Operator policy:\n{policy.strip() or '(none — follow the user safely)'}",
         ]
     )
 
 
 def build_realtime_tools() -> list[dict[str, Any]]:
-    tools: list[dict[str, Any]] = []
-    for tool in build_code_tool_definitions():
-        tools.append({k: v for k, v in tool.items() if k != "strict"})
-    return tools
+    return build_gui_tool_definitions(include_exec_py=True)
 
 
-def session_config(policy: str, model: str, voice: str) -> dict[str, Any]:
-    # VAD: far_field NR + low eagerness reduces false barges from room noise / laptop mic.
-    # Docs: https://platform.openai.com/docs/guides/realtime-vad
+def session_config(policy: str, model: str, voice: str, plan: str = "") -> dict[str, Any]:
     return {
         "type": "realtime",
         "model": model,
         "output_modalities": ["audio"],
-        "instructions": build_instructions(policy),
+        "instructions": build_instructions(policy, plan=plan),
         "tools": build_realtime_tools(),
         "tool_choice": "auto",
         "audio": {
@@ -109,7 +113,10 @@ class RealtimeSession:
         self._paused = False
         self._current_item_id: str | None = None
         self._audio_played_ms = 0
-        self._namespace: dict[str, Any] = {}
+        self._harness: DesktopHarness | None = None
+        self._context = ContextManager()
+        self._stuck = StuckDetector()
+        self._actions_frozen = False
 
     @property
     def running(self) -> bool:
@@ -122,17 +129,15 @@ class RealtimeSession:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing. Set it in the repo .env file.")
 
-        import time as time_mod
-
-        from god_worker.desktop import open_app
-
-        self._namespace = {"pyautogui": self.pyautogui, "time": time_mod, "open_app": open_app}
+        self._harness = DesktopHarness(self.pyautogui, emit=self.emit)
+        self._context = ContextManager()
+        self._stuck = StuckDetector()
+        self._actions_frozen = False
         self._wrap_agent_moves()
         self._stop.clear()
         self.cancel.clear()
         self._thread = threading.Thread(target=self._run, name="god-realtime", daemon=True)
         self._thread.start()
-        # Mouse watch starts only after the WebSocket is up (see _run).
 
     def stop(self) -> None:
         self._stop.set()
@@ -171,7 +176,7 @@ class RealtimeSession:
         with self._conn_lock:
             conn = self._connection
         if conn is None:
-            return  # Not connected yet / already closed — ignore (e.g. early mouse notice).
+            return
         conn.conversation.item.create(
             item={
                 "type": "message",
@@ -186,11 +191,27 @@ class RealtimeSession:
         original = self.pyautogui.moveTo
 
         def move_to(*args: Any, **kwargs: Any) -> Any:
-            duration = float(kwargs.get("duration", 0.45) or 0.45)
+            duration = float(kwargs.get("duration", 0.65) or 0.65)
             self._agent_moving_until = time.time() + duration + 0.35
             return original(*args, **kwargs)
 
         self.pyautogui.moveTo = move_to
+
+    def _refresh_session_instructions(self, connection: Any) -> None:
+        plan = self._harness.plan if self._harness else ""
+        ctx = self._context.prompt_block()
+        instructions = build_instructions(self.policy, plan=plan)
+        if ctx:
+            instructions = instructions + "\n\n" + ctx
+        try:
+            connection.session.update(
+                session={
+                    "type": "realtime",
+                    "instructions": instructions,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run(self) -> None:
         from openai import OpenAI
@@ -207,8 +228,9 @@ class RealtimeSession:
             with client.realtime.connect(model=self.model) as connection:
                 with self._conn_lock:
                     self._connection = connection
+                plan = self._harness.plan if self._harness else ""
                 connection.session.update(
-                    session=session_config(self.policy, self.model, self.voice)
+                    session=session_config(self.policy, self.model, self.voice, plan=plan)
                 )
                 if self._mouse_thread is None or not self._mouse_thread.is_alive():
                     self._mouse_thread = threading.Thread(
@@ -222,7 +244,6 @@ class RealtimeSession:
                         "message": "Realtime session open — speak naturally.",
                     }
                 )
-                # Greeting so the operator hears the voice path immediately.
                 connection.conversation.item.create(
                     item={
                         "type": "message",
@@ -232,7 +253,7 @@ class RealtimeSession:
                                 "type": "input_text",
                                 "text": (
                                     "System: Session started. Greet the operator briefly "
-                                    "and say you are ready to talk and help on their Mac."
+                                    "and say you can operate any Mac app with visible mouse control."
                                 ),
                             }
                         ],
@@ -279,7 +300,6 @@ class RealtimeSession:
             if item_id:
                 self._current_item_id = item_id
             if isinstance(delta, str) and delta:
-                # 24 kHz mono pcm16 → 48 bytes/ms
                 try:
                     import base64
 
@@ -321,6 +341,7 @@ class RealtimeSession:
                 ):
                     self._awaiting_continue = False
                     self._paused = False
+                    self._actions_frozen = False
             return
 
         if etype == "response.done":
@@ -361,21 +382,12 @@ class RealtimeSession:
             name = getattr(item, "name", None) or item.get("name")
             call_id = getattr(item, "call_id", None) or item.get("call_id")
             arguments = getattr(item, "arguments", None) or item.get("arguments") or "{}"
-            if name != "exec_py":
-                connection.conversation.item.create(
-                    item={
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps({"error": f"Unknown tool: {name}"}),
-                    }
-                )
-                continue
-            calls.append({"call_id": call_id, "arguments": arguments})
+            calls.append({"name": name, "call_id": call_id, "arguments": arguments})
 
         if not calls:
             return
 
-        if self._paused or self._awaiting_continue:
+        if self._paused or self._awaiting_continue or self._actions_frozen:
             for call in calls:
                 connection.conversation.item.create(
                     item={
@@ -384,7 +396,7 @@ class RealtimeSession:
                         "output": json.dumps(
                             {
                                 "paused": True,
-                                "message": "Operator moved the mouse; waiting for them to say continue.",
+                                "message": "Desktop actions paused — waiting for operator to continue.",
                             }
                         ),
                     }
@@ -392,44 +404,85 @@ class RealtimeSession:
             connection.response.create()
             return
 
+        harness = self._harness
+        if harness is None:
+            return
+
         for call in calls:
             if self.cancel.is_set() or self._stop.is_set():
                 return
+            name = call["name"]
             try:
-                args = json.loads(call["arguments"])
-                code = args.get("code") if isinstance(args, dict) else None
-                if not isinstance(code, str) or not code.strip():
-                    raise RuntimeError("exec_py requires nonempty code.")
+                args_obj = json.loads(call["arguments"]) if isinstance(call["arguments"], str) else call["arguments"]
+            except json.JSONDecodeError:
+                args_obj = {}
+            args_key = json.dumps(args_obj, sort_keys=True, ensure_ascii=False)[:240]
+
+            result = harness.dispatch(str(name), args_obj if isinstance(args_obj, dict) else {})
+            ok = bool(result.get("ok"))
+            stuck = self._stuck.observe(str(name), args_key, ok=ok)
+            model_text = tool_result_for_model(result)
+            if stuck.get("stuck"):
+                model_text = json.dumps(
+                    {**json.loads(model_text), "stuck": stuck},
+                    ensure_ascii=False,
+                )
                 self.emit(
                     {
                         "type": "agent_event",
-                        "level": "pending",
-                        "message": f"exec_py: {code[:180]}{'…' if len(code) > 180 else ''}",
+                        "level": "error" if stuck.get("action") == "stop" else "info",
+                        "message": stuck.get("message", "stuck"),
                     }
                 )
-                if self._paused:
-                    raise RuntimeError("Paused — operator moved the mouse.")
-                output_parts = execute_code(code, self._namespace)
-                # Realtime function output is a string; summarize multimodal parts.
-                text_bits: list[str] = []
-                for part in output_parts:
-                    if part.get("type") == "input_text":
-                        text_bits.append(str(part.get("text", "")))
-                    elif part.get("type") == "input_image":
-                        text_bits.append("[screenshot attached as base64 image in local session]")
-                        # Also push image into conversation memory as a user note (text summary).
-                result = "\n".join(text_bits) or "exec_py completed."
-            except Exception as error:  # noqa: BLE001
-                result = f"exec_py error: {error}"
-                self.emit({"type": "agent_event", "level": "error", "message": str(error)})
+                if stuck.get("action") == "stop":
+                    self._actions_frozen = True
+
+            bulky = "image_base64" in str(result) or name in {"screenshot", "click", "type_text", "hotkey", "open_app"}
+            self._context.add(str(name), model_text, bulky=bulky)
 
             connection.conversation.item.create(
                 item={
                     "type": "function_call_output",
                     "call_id": call["call_id"],
-                    "output": result,
+                    "output": model_text,
                 }
             )
+
+            image = extract_verify_image(result)
+            if image and image.get("image_base64") and not self._actions_frozen:
+                # Attach a compact screenshot so the model can see the UI (Realtime image input).
+                try:
+                    connection.conversation.item.create(
+                        item={
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        f"Verify screenshot after {name} "
+                                        f"({image.get('width')}x{image.get('height')}). "
+                                        f"{image.get('stub') or ''}"
+                                    ),
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/png;base64,{image['image_base64']}",
+                                },
+                            ],
+                        }
+                    )
+                except Exception as error:  # noqa: BLE001
+                    self.emit(
+                        {
+                            "type": "agent_event",
+                            "level": "error",
+                            "message": f"screenshot attach failed: {error}",
+                        }
+                    )
+
+            if name == "update_plan" or stuck.get("stuck"):
+                self._refresh_session_instructions(connection)
 
         if not self.cancel.is_set() and not self._stop.is_set():
             connection.response.create()
