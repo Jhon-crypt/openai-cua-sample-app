@@ -6,7 +6,8 @@
 | desktop-worker | Python process: screenshots, mouse/keyboard, input release on stop | — |
 | agent-loop | Model turns, tool calls (`exec_py`-style), spoken policy in context (Responses fallback) | desktop-worker, shell-hud |
 | realtime | OpenAI Realtime duplex voice + GUI tools + plan/context/stuck + mouse-interrupt | desktop-worker, shell-hud |
-| gui-tools | Structured `open_app` / `screenshot` / `click` / `type_text` / `hotkey` (+ `exec_py`) | desktop-worker |
+| gui-tools | Structured GUI tools + scaled `click` + `click_text` (Vision OCR) + `click_element` (AX) | desktop-worker |
+| grounding | Screenshot↔screen mapping, OCR, Accessibility hit-testing | gui-tools |
 | harness-plan | Persistent `update_plan` injected into Realtime instructions | realtime |
 | harness-context | T4-style elision + summary of bulky tool results | realtime |
 | harness-stuck | Repeated failing-tool streaks → remind / freeze | realtime |

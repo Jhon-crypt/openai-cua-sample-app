@@ -14,7 +14,17 @@ from god_worker.stuck import StuckDetector
 def test_gui_tool_definitions_include_core_and_exec_py():
     tools = build_gui_tool_definitions()
     names = {t["name"] for t in tools}
-    assert {"open_app", "screenshot", "click", "type_text", "hotkey", "update_plan", "exec_py"} <= names
+    assert {
+        "open_app",
+        "screenshot",
+        "click",
+        "click_text",
+        "click_element",
+        "type_text",
+        "hotkey",
+        "update_plan",
+        "exec_py",
+    } <= names
     assert all("strict" not in t for t in tools)
 
 
@@ -43,9 +53,11 @@ def test_update_plan_and_click(monkeypatch):
     assert plan["ok"] is True
     assert "Safari" in harness.plan
 
+    pag.size.return_value = (200, 100)
     out = harness.dispatch("click", {"x": 10, "y": 20})
     assert out["ok"] is True
     pag.click.assert_called()
+    assert "screen_x" in out
     assert out["verify"]["width"] == 200 or out["verify"]["width"] <= 1024
 
 

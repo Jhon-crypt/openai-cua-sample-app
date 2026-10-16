@@ -14,7 +14,7 @@ uv run --project labs/god/worker pytest
 cd labs/god/macos && swift run God
 ```
 
-In the HUD: **Start Session** opens a Realtime conversation (mic streams automatically). Just talk — God replies by voice and can drive **any Mac app** mid-conversation (visible red cursor ring). Type optional text via **Send Text**.
+In the HUD: **Start Session** opens a Realtime conversation (mic streams automatically). Just talk — God replies by voice and can drive **any Mac app** mid-conversation (visible red cursor ring). Prefer asking it to click labels (`click_text`); raw `click` coords are mapped from the screenshot. Type optional text via **Send Text**.
 
 If you move the mouse yourself, God pauses and says to tell it when to continue. Repeated identical failures freeze actions after a stuck warning.
 

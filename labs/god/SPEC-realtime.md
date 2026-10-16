@@ -10,7 +10,8 @@ Harness components (inspired by Fan et al. arXiv:2609.20804):
 
 | Component | Implementation |
 |-----------|----------------|
-| Action space | `open_app`, `screenshot`, `click`, `type_text`, `hotkey`, `update_plan`, plus `exec_py` escape |
+| Action space | `open_app`, `screenshot`, `click_text` (OCR), `click_element` (AX), `click` (scaled), `type_text`, `hotkey`, `update_plan`, plus `exec_py` escape |
+| Coordinate map | `click(x,y)` is in latest screenshot pixel space → harness scales to `pyautogui` screen |
 | Planning | `update_plan` + plan injected into session instructions |
 | Context | Local T4-style elision of bulky tool results + running summary injected into instructions |
 | Verify | Auto-screenshot after open/click/type/hotkey; attach compact PNG to conversation when possible |

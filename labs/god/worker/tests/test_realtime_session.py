@@ -10,6 +10,8 @@ def test_instructions_mention_mouse_interrupt_and_gui_tools():
     assert "ANY macOS application" in text
     assert "open_app" in text
     assert "update_plan" in text
+    assert "click_text" in text
+    assert "screenshot pixel" in text.lower() or "img_w" in text
     assert "1. open Notes" in text
 
 
@@ -18,6 +20,8 @@ def test_realtime_tools_include_gui_and_exec_py():
     names = {t["name"] for t in tools}
     assert "exec_py" in names
     assert "click" in names
+    assert "click_text" in names
+    assert "click_element" in names
     assert "screenshot" in names
     assert all("strict" not in t for t in tools)
 

@@ -1,4 +1,4 @@
-"""Structured GUI action space for God (paper-style predefined tools + exec_py escape)."""
+"""Structured GUI action space for God (scaled clicks + text/element grounding)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from god_worker.agent_loop import build_code_tool_definitions, execute_code
 from god_worker.desktop import open_app
+from god_worker.grounding import ax_find_elements, map_image_to_screen, ocr_find_text
 
 Emit = Callable[[dict[str, Any]], None]
 
@@ -19,26 +20,63 @@ def build_gui_tool_definitions(*, include_exec_py: bool = True) -> list[dict[str
         {
             "type": "function",
             "name": "open_app",
-            "description": "Launch or focus any macOS app by name (Safari, Slack, Notes, Finder, …). Never use Spotlight.",
+            "description": "Launch or focus any macOS app by name (Safari, Slack, Notes, Finder, Chrome…). Never Spotlight.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["name"],
                 "properties": {
-                    "name": {"type": "string", "description": "Exact Application name, e.g. Notes, Safari, Slack."}
+                    "name": {"type": "string", "description": "Exact Application name, e.g. Google Chrome, Notes."}
                 },
             },
         },
         {
             "type": "function",
             "name": "screenshot",
-            "description": "Capture the screen. Coordinates match click(x,y). Prefer after open_app or before clicking.",
+            "description": (
+                "Capture the screen for the model. Returns img_w/img_h of THIS image and screen_w/screen_h. "
+                "click(x,y) uses coordinates in this image's pixel space (harness scales to the real screen)."
+            ),
             "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
         },
         {
             "type": "function",
+            "name": "click_text",
+            "description": (
+                "PREFERRED: click visible on-screen text via OCR (e.g. query='John Oladele'). "
+                "Use for Chrome profile tiles, buttons labeled with text, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+        {
+            "type": "function",
+            "name": "click_element",
+            "description": (
+                "PREFERRED for native Mac controls: click an Accessibility node by title/label "
+                "(optional role like AXButton). Falls back poorly for some Chrome web UI — use click_text there."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "role": {"type": "string", "description": "Optional AX role substring, e.g. button."},
+                },
+            },
+        },
+        {
+            "type": "function",
             "name": "click",
-            "description": "Move the visible cursor slowly to (x,y) then click. Screen coords match screenshot.",
+            "description": (
+                "Click at (x,y) in the LATEST screenshot pixel space (img_w×img_h from screenshot/verify). "
+                "Prefer click_text/click_element when the target has a label."
+            ),
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -81,17 +119,12 @@ def build_gui_tool_definitions(*, include_exec_py: bool = True) -> list[dict[str
         {
             "type": "function",
             "name": "update_plan",
-            "description": "Create or replace the persistent multi-step plan for the current goal. Call before long UI tasks.",
+            "description": "Create or replace the persistent multi-step plan for the current goal.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["plan"],
-                "properties": {
-                    "plan": {
-                        "type": "string",
-                        "description": "Numbered steps and status (todo/doing/done).",
-                    }
-                },
+                "properties": {"plan": {"type": "string"}},
             },
         },
     ]
@@ -101,7 +134,7 @@ def build_gui_tool_definitions(*, include_exec_py: bool = True) -> list[dict[str
     return tools
 
 
-def _image_to_png_b64(image: Any, max_width: int = 1024) -> tuple[str, int, int]:
+def _image_to_png_b64(image: Any, max_width: int = 1024) -> tuple[Any, str, int, int]:
     from PIL import Image
 
     if not isinstance(image, Image.Image):
@@ -114,7 +147,7 @@ def _image_to_png_b64(image: Any, max_width: int = 1024) -> tuple[str, int, int]
         w, h = img.size
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("ascii"), w, h
+    return img, base64.b64encode(buf.getvalue()).decode("ascii"), w, h
 
 
 class DesktopHarness:
@@ -132,6 +165,7 @@ class DesktopHarness:
             "open_app": open_app,
         }
         self._last_screenshot_meta: dict[str, Any] | None = None
+        self._last_shot_image: Any | None = None
 
     def dispatch(self, name: str, arguments: dict[str, Any] | str) -> dict[str, Any]:
         if isinstance(arguments, str):
@@ -142,6 +176,8 @@ class DesktopHarness:
             "open_app": self._open_app,
             "screenshot": self._screenshot,
             "click": self._click,
+            "click_text": self._click_text,
+            "click_element": self._click_element,
             "type_text": self._type_text,
             "hotkey": self._hotkey,
             "update_plan": self._update_plan,
@@ -154,6 +190,10 @@ class DesktopHarness:
             return handler(arguments)
         except Exception as error:  # noqa: BLE001
             return {"ok": False, "error": str(error), "tool": name}
+
+    def _screen_size(self) -> tuple[int, int]:
+        size = self.pyautogui.size()
+        return int(size[0]), int(size[1])
 
     def _open_app(self, args: dict[str, Any]) -> dict[str, Any]:
         name = str(args.get("name") or "").strip()
@@ -171,37 +211,164 @@ class DesktopHarness:
 
     def _screenshot_core(self, verify_of: str | None = None) -> dict[str, Any]:
         image = self.pyautogui.screenshot()
-        b64, w, h = _image_to_png_b64(image)
+        screen_w, screen_h = self._screen_size()
+        # Logical size after normalize_screenshots should already match screen_w/h.
+        shot_img, b64, w, h = _image_to_png_b64(image)
+        scale_x = screen_w / float(w) if w else 1.0
+        scale_y = screen_h / float(h) if h else 1.0
         meta = {
+            "img_w": w,
+            "img_h": h,
             "width": w,
             "height": h,
+            "screen_w": screen_w,
+            "screen_h": screen_h,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
             "image_base64": b64,
             "format": "png",
-            "bytes": len(b64) * 3 // 4,
             "verify_of": verify_of,
-            "stub": f"[screenshot {w}x{h} png]",
+            "stub": f"[screenshot img={w}x{h} screen={screen_w}x{screen_h}]",
         }
         self._last_screenshot_meta = meta
-        # HUD can ignore; keep payload light in events
-        self.emit({"type": "agent_event", "level": "info", "message": f"screenshot {w}x{h}"})
+        self._last_shot_image = shot_img
+        self.emit(
+            {
+                "type": "agent_event",
+                "level": "info",
+                "message": f"screenshot img {w}x{h} → screen {screen_w}x{screen_h}",
+            }
+        )
         return {
+            "img_w": w,
+            "img_h": h,
             "width": w,
             "height": h,
+            "screen_w": screen_w,
+            "screen_h": screen_h,
+            "scale_x": round(scale_x, 4),
+            "scale_y": round(scale_y, 4),
             "stub": meta["stub"],
             "image_base64": b64,
             "format": "png",
             "verify_of": verify_of,
+            "coord_space": "screenshot_pixels",
         }
+
+    def _require_shot_meta(self) -> dict[str, Any]:
+        if not self._last_screenshot_meta:
+            self._screenshot_core(verify_of="auto_before_click")
+        assert self._last_screenshot_meta is not None
+        return self._last_screenshot_meta
+
+    def _click_screen(self, screen_x: int, screen_y: int, *, button: str = "left") -> None:
+        self.pyautogui.click(screen_x, screen_y, button=button)
 
     def _click(self, args: dict[str, Any]) -> dict[str, Any]:
         x = int(args["x"])
         y = int(args["y"])
         button = str(args.get("button") or "left")
-        self.emit({"type": "agent_event", "level": "pending", "message": f"click({x},{y})"})
-        self.pyautogui.click(x, y, button=button)
+        meta = self._require_shot_meta()
+        screen_x, screen_y = map_image_to_screen(
+            x,
+            y,
+            img_w=int(meta["img_w"]),
+            img_h=int(meta["img_h"]),
+            screen_w=int(meta["screen_w"]),
+            screen_h=int(meta["screen_h"]),
+        )
+        self.emit(
+            {
+                "type": "agent_event",
+                "level": "pending",
+                "message": f"click img({x},{y}) → screen({screen_x},{screen_y})",
+            }
+        )
+        self._click_screen(screen_x, screen_y, button=button)
         time.sleep(0.15)
-        verify = self._screenshot_core(verify_of=f"click:{x},{y}")
-        return {"ok": True, "x": x, "y": y, "button": button, "verify": verify}
+        verify = self._screenshot_core(verify_of=f"click:{screen_x},{screen_y}")
+        return {
+            "ok": True,
+            "x": x,
+            "y": y,
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "button": button,
+            "mapped_from": "screenshot_pixels",
+            "verify": verify,
+        }
+
+    def _click_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise RuntimeError("click_text requires query.")
+        # Fresh full-res logical screenshot for OCR accuracy, then map via that image size.
+        full = self.pyautogui.screenshot()
+        screen_w, screen_h = self._screen_size()
+        self.emit({"type": "agent_event", "level": "pending", "message": f"click_text({query!r})"})
+        hits = ocr_find_text(full, query)
+        if not hits:
+            raise RuntimeError(f"No OCR match for {query!r}.")
+        best = hits[0]
+        # OCR coords are in full image space (== screen logical size after normalize).
+        img_w, img_h = int(best["img_w"]), int(best["img_h"])
+        screen_x, screen_y = map_image_to_screen(
+            best["x"],
+            best["y"],
+            img_w=img_w,
+            img_h=img_h,
+            screen_w=screen_w,
+            screen_h=screen_h,
+        )
+        self._click_screen(screen_x, screen_y)
+        time.sleep(0.15)
+        verify = self._screenshot_core(verify_of=f"click_text:{query}")
+        return {
+            "ok": True,
+            "query": query,
+            "matched": best["text"],
+            "score": best["score"],
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "candidates": [{"text": h["text"], "score": h["score"]} for h in hits[:5]],
+            "verify": verify,
+        }
+
+    def _click_element(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip()
+        role = args.get("role")
+        role_s = str(role).strip() if isinstance(role, str) and role.strip() else None
+        if not query:
+            raise RuntimeError("click_element requires query.")
+        self.emit(
+            {
+                "type": "agent_event",
+                "level": "pending",
+                "message": f"click_element({query!r}, role={role_s!r})",
+            }
+        )
+        hits = ax_find_elements(query, role=role_s)
+        if not hits:
+            raise RuntimeError(
+                f"No Accessibility match for {query!r}. "
+                "Grant Accessibility to the God worker, or use click_text for Chrome/web UI."
+            )
+        best = hits[0]
+        screen_x, screen_y = int(best["x"]), int(best["y"])
+        self._click_screen(screen_x, screen_y)
+        time.sleep(0.15)
+        verify = self._screenshot_core(verify_of=f"click_element:{query}")
+        return {
+            "ok": True,
+            "query": query,
+            "matched": best["label"],
+            "role": best["role"],
+            "score": best["score"],
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "candidates": [{"label": h["label"], "role": h["role"], "score": h["score"]} for h in hits[:5]],
+            "verify": verify,
+        }
 
     def _type_text(self, args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text")
@@ -265,10 +432,21 @@ def tool_result_for_model(result: dict[str, Any]) -> str:
     verify = slim.get("verify")
     if isinstance(verify, dict):
         slim["verify"] = {
-            "width": verify.get("width"),
-            "height": verify.get("height"),
-            "stub": verify.get("stub"),
-            "verify_of": verify.get("verify_of"),
+            k: verify.get(k)
+            for k in (
+                "img_w",
+                "img_h",
+                "width",
+                "height",
+                "screen_w",
+                "screen_h",
+                "scale_x",
+                "scale_y",
+                "stub",
+                "verify_of",
+                "coord_space",
+            )
+            if verify.get(k) is not None
         }
     if "image_base64" in slim:
         slim["image_base64"] = "<omitted; see attached screenshot item if present>"
@@ -281,16 +459,16 @@ def extract_verify_image(result: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(result.get("image_base64"), str) and result.get("image_base64"):
         return {
             "image_base64": result["image_base64"],
-            "width": result.get("width"),
-            "height": result.get("height"),
+            "width": result.get("width") or result.get("img_w"),
+            "height": result.get("height") or result.get("img_h"),
             "stub": result.get("stub"),
         }
     verify = result.get("verify")
     if isinstance(verify, dict) and isinstance(verify.get("image_base64"), str):
         return {
             "image_base64": verify["image_base64"],
-            "width": verify.get("width"),
-            "height": verify.get("height"),
+            "width": verify.get("width") or verify.get("img_w"),
+            "height": verify.get("height") or verify.get("img_h"),
             "stub": verify.get("stub"),
             "verify_of": verify.get("verify_of"),
         }
