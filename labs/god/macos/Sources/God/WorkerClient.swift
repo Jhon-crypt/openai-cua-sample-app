@@ -21,32 +21,36 @@ final class WorkerClient: ObservableObject {
 
     private var process: Process?
     private var stdinPipe: Pipe?
-    private var readTask: Task<Void, Never>?
-    private var stderrTask: Task<Void, Never>?
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var buffer = Data()
     private var stderrText = ""
     private var sawReady = false
+    private var timeoutTask: Task<Void, Never>?
 
     func start() async throws {
         if process?.isRunning == true, ready { return }
         stopWorker()
 
+        statusText = "Starting worker…"
         let workerProject = Self.workerProjectURL()
-        guard FileManager.default.fileExists(atPath: workerProject.appendingPathComponent("pyproject.toml").path) else {
+        let marker = workerProject.appendingPathComponent("pyproject.toml")
+        guard FileManager.default.fileExists(atPath: marker.path) else {
             throw WorkerClientError.spawnFailed("Worker project missing at \(workerProject.path)")
         }
 
-        let uv = Self.resolveUvURL()
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
+        let launch = Self.launchConfiguration(workerProject: workerProject)
 
-        process.executableURL = uv
-        process.arguments = ["run", "--project", workerProject.path, "python", "-m", "god_worker"]
+        process.executableURL = launch.executable
+        process.arguments = launch.arguments
         process.environment = Self.workerEnvironment()
+        process.currentDirectoryURL = workerProject
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
@@ -56,56 +60,60 @@ final class WorkerClient: ObservableObject {
 
         sawReady = false
         stderrText = ""
+        buffer = Data()
         readyContinuation = nil
+        statusText = "Starting \(launch.executable.lastPathComponent)…"
 
-        // Register waiter before run() so an early "ready" line cannot be missed.
-        let readyWait = Task { @MainActor in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                if self.sawReady {
-                    continuation.resume()
-                    return
+        attachReaders(stdout: stdout, stderr: stderr)
+        try await startProcess(process, stdin: stdin, stdout: stdout, stderr: stderr, launchLabel: launch.display)
+    }
+
+    private func startProcess(
+        _ process: Process,
+        stdin: Pipe,
+        stdout: Pipe,
+        stderr: Pipe,
+        launchLabel: String
+    ) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.readyContinuation = continuation
+            self.timeoutTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard !Task.isCancelled else { return }
+                if let pendingReady = self.readyContinuation {
+                    self.readyContinuation = nil
+                    let detail = self.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let message = detail.isEmpty
+                        ? "Timed out after 20s starting worker (\(launchLabel))."
+                        : "Timed out: \(detail)"
+                    self.statusText = message
+                    pendingReady.resume(throwing: WorkerClientError.spawnFailed(message))
                 }
-                self.readyContinuation = continuation
             }
-        }
 
-        let timeout = Task { @MainActor in
-            try await Task.sleep(nanoseconds: 60_000_000_000)
-            if let pendingReady = self.readyContinuation {
+            do {
+                try process.run()
+                self.process = process
+                self.stdinPipe = stdin
+                self.stdoutPipe = stdout
+                self.stderrPipe = stderr
+                self.ready = false
+                self.statusText = "Waiting for worker ready…"
+            } catch {
+                self.timeoutTask?.cancel()
                 self.readyContinuation = nil
-                let detail = self.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
-                let message = detail.isEmpty ? "Timed out waiting for the worker." : detail
-                pendingReady.resume(throwing: WorkerClientError.spawnFailed(message))
+                continuation.resume(throwing: WorkerClientError.spawnFailed(error.localizedDescription))
             }
         }
-
-        do {
-            try process.run()
-        } catch {
-            timeout.cancel()
-            readyWait.cancel()
-            throw WorkerClientError.spawnFailed(error.localizedDescription)
-        }
-
-        self.process = process
-        self.stdinPipe = stdin
-        self.statusText = "Starting worker…"
-        self.ready = false
-
-        readTask = Task { await self.readLoop(handle: stdout.fileHandleForReading) }
-        stderrTask = Task { await self.readStderr(handle: stderr.fileHandleForReading) }
-
-        do {
-            try await readyWait.value
-            timeout.cancel()
-        } catch {
-            timeout.cancel()
-            stopWorker()
-            throw error
-        }
+        timeoutTask?.cancel()
+        timeoutTask = nil
     }
 
     func stopWorker() {
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        detachReaders()
+
         let running = process
         if running?.isRunning == true {
             if let stdin = stdinPipe {
@@ -114,13 +122,10 @@ final class WorkerClient: ObservableObject {
                     var line = data
                     line.append(0x0A)
                     try? stdin.fileHandleForWriting.write(contentsOf: line)
-                    Thread.sleep(forTimeInterval: 0.15)
                 }
             }
             running?.terminate()
         }
-        readTask?.cancel()
-        stderrTask?.cancel()
         handleTermination(exitCode: running?.terminationStatus)
     }
 
@@ -145,22 +150,70 @@ final class WorkerClient: ObservableObject {
         }
     }
 
+    private func attachReaders(stdout: Pipe, stderr: Pipe) {
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            Task { @MainActor in
+                self?.consumeStdout(chunk)
+            }
+        }
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            Task { @MainActor in
+                self?.consumeStderr(chunk)
+            }
+        }
+    }
+
+    private func detachReaders() {
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+    }
+
+    private func consumeStdout(_ chunk: Data) {
+        buffer.append(chunk)
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let lineData = Data(buffer[..<newline])
+            buffer.removeSubrange(...newline)
+            handleLine(lineData)
+        }
+    }
+
+    private func consumeStderr(_ chunk: Data) {
+        if let text = String(data: chunk, encoding: .utf8) {
+            stderrText += text
+            if stderrText.count > 8_000 {
+                stderrText = String(stderrText.suffix(4_000))
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !ready {
+                statusText = "Worker: \(trimmed.prefix(120))"
+            }
+        }
+    }
+
     private func handleTermination(exitCode: Int32?) {
-        let wasWaiting = readyContinuation != nil
+        detachReaders()
+        timeoutTask?.cancel()
+        timeoutTask = nil
         ready = false
         process = nil
         stdinPipe = nil
+        stdoutPipe = nil
+        stderrPipe = nil
 
         if let readyContinuation {
             self.readyContinuation = nil
             let detail = stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
             let code = exitCode.map(String.init) ?? "?"
             let message = detail.isEmpty
-                ? "Worker exited before ready (code \(code)). Is uv installed?"
+                ? "Worker exited before ready (code \(code))."
                 : "Worker exited (code \(code)): \(detail)"
             statusText = message
             readyContinuation.resume(throwing: WorkerClientError.spawnFailed(message))
-        } else if !wasWaiting {
+        } else if !ready {
             statusText = "Disconnected"
         }
 
@@ -168,40 +221,6 @@ final class WorkerClient: ObservableObject {
             continuation.resume(throwing: WorkerClientError.notRunning)
         }
         pending.removeAll()
-    }
-
-    private func readLoop(handle: FileHandle) async {
-        while !Task.isCancelled {
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                if process?.isRunning != true { break }
-                try? await Task.sleep(nanoseconds: 20_000_000)
-                continue
-            }
-            buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let lineData = Data(buffer[..<newline])
-                buffer.removeSubrange(...newline)
-                handleLine(lineData)
-            }
-        }
-    }
-
-    private func readStderr(handle: FileHandle) async {
-        while !Task.isCancelled {
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                if process?.isRunning != true { break }
-                try? await Task.sleep(nanoseconds: 20_000_000)
-                continue
-            }
-            if let text = String(data: chunk, encoding: .utf8) {
-                stderrText += text
-                if stderrText.count > 8_000 {
-                    stderrText = String(stderrText.suffix(4_000))
-                }
-            }
-        }
     }
 
     private func handleLine(_ lineData: Data) {
@@ -215,6 +234,8 @@ final class WorkerClient: ObservableObject {
             sawReady = true
             ready = true
             statusText = (payload["detail"] as? String) ?? "Ready"
+            timeoutTask?.cancel()
+            timeoutTask = nil
             readyContinuation?.resume()
             readyContinuation = nil
             return
@@ -222,6 +243,8 @@ final class WorkerClient: ObservableObject {
         if type == "error", payload["id"] == nil {
             let message = (payload["error"] as? String) ?? "unknown"
             statusText = "Error: \(message)"
+            timeoutTask?.cancel()
+            timeoutTask = nil
             readyContinuation?.resume(throwing: WorkerClientError.spawnFailed(message))
             readyContinuation = nil
             return
@@ -231,12 +254,33 @@ final class WorkerClient: ObservableObject {
         }
     }
 
+    private struct LaunchConfiguration {
+        var executable: URL
+        var arguments: [String]
+        var display: String
+    }
+
+    private static func launchConfiguration(workerProject: URL) -> LaunchConfiguration {
+        let venvPython = workerProject.appendingPathComponent(".venv/bin/python")
+        if FileManager.default.isExecutableFile(atPath: venvPython.path) {
+            return LaunchConfiguration(
+                executable: venvPython,
+                arguments: ["-m", "god_worker"],
+                display: venvPython.path
+            )
+        }
+        let uv = resolveUvURL()
+        return LaunchConfiguration(
+            executable: uv,
+            arguments: ["run", "--project", workerProject.path, "python", "-m", "god_worker"],
+            display: "\(uv.lastPathComponent) run"
+        )
+    }
+
     static func workerProjectURL() -> URL {
         if let override = ProcessInfo.processInfo.environment["GOD_WORKER_PROJECT"] {
             return URL(fileURLWithPath: override, isDirectory: true)
         }
-        // Walk up from this source file until we find labs/god/worker/pyproject.toml
-        // (#filePath is .../macos/Sources/God/WorkerClient.swift — need four parents to reach god/).
         var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         let fm = FileManager.default
         for _ in 0..<8 {
@@ -250,10 +294,10 @@ final class WorkerClient: ObservableObject {
             directory = parent
         }
         return URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // God
-            .deletingLastPathComponent() // Sources
-            .deletingLastPathComponent() // macos
-            .deletingLastPathComponent() // god
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
             .appendingPathComponent("worker", isDirectory: true)
     }
 

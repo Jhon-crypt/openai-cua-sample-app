@@ -72,10 +72,11 @@ struct ContentView: View {
     private func startSession() async {
         busy = true
         defer { busy = false }
+        append("Starting session…")
         do {
             try await worker.start()
             session = .listening
-            append("Session open — mic stays open in a later slice; worker ready now.")
+            append("Session open — worker ready.")
         } catch {
             session = .idle
             append("Start failed: \(error.localizedDescription)")
