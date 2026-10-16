@@ -7,7 +7,7 @@ Personal **voice Mac operator** workspace. Not a browser lab template — do **n
 Requires root `.env` with `OPENAI_API_KEY`. Primary harness = **OpenAI Realtime API** (duplex voice + `exec_py`). Optional fallback: Responses loop.
 
 ```bash
-uv sync --project labs/god/worker --extra dev
+uv sync --project labs/god/worker --extra dev   # pulls openai[realtime] (websockets)
 uv run --project labs/god/worker python -m god_worker --check
 uv run --project labs/god/worker pytest
 
