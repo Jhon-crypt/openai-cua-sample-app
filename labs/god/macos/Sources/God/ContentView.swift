@@ -6,10 +6,10 @@ struct ContentView: View {
     @StateObject private var speech = SpeechPlayer()
     @StateObject private var cursor = CursorOverlayController()
     @State private var session: SessionPhase = .idle
-    @State private var log: [String] = ["God — conversational desktop operator. Mic fills Goal and auto-runs."]
+    @State private var log: [String] = ["God — realtime voice operator. Start Session, then just talk."]
     @State private var busy = false
-    @State private var autoRunAfterMic = true
-    @State private var goal = "Open Notes and type hello from God"
+    @State private var realtimeLive = false
+    @State private var goal = ""
     @State private var policy = "Do not delete files. Stop if unsure."
     @State private var inputTokens = 0
     @State private var outputTokens = 0
@@ -35,13 +35,13 @@ struct ContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            if voice.isRecording {
-                Text("Recording… tap Stop Mic when finished speaking.")
+            if voice.isStreaming {
+                Text("Realtime mic live — speak naturally.")
                     .font(.callout.weight(.semibold))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.green)
             }
             if speech.isSpeaking {
-                Text("Speaking…")
+                Text("God speaking…")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.blue)
             }
@@ -49,35 +49,32 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 Button("Start Session") { Task { await startSession() } }
                     .disabled(busy || session == .listening || session == .acting)
-                Button(voice.isRecording ? "Stop Mic" : "Mic") { Task { await toggleMic() } }
-                    .disabled(busy || !worker.ready || session == .idle || session == .stopped)
-                Button("Run Goal") { Task { await runGoal() } }
+                Button(voice.isStreaming ? "Mute Mic" : "Mic Live") { Task { await toggleRealtimeMic() } }
+                    .disabled(busy || !worker.ready || !realtimeLive || session == .idle || session == .stopped)
+                Button("Send Text") { Task { await sendTextGoal() } }
                     .disabled(
                         busy
-                            || voice.isRecording
                             || !worker.ready
+                            || !realtimeLive
                             || goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             || session == .idle
                             || session == .stopped
                     )
                 Button("Test Click") { Task { await testClick() } }
-                    .disabled(busy || voice.isRecording || !worker.ready || session == .stopped || session == .idle)
+                    .disabled(busy || !worker.ready || session == .stopped || session == .idle)
                 Button("Stop", role: .destructive) { Task { await stopSession() } }
                     .disabled(busy || session == .idle || session == .stopped)
                     .keyboardShortcut(".", modifiers: [.command, .shift])
             }
 
-            Toggle("Auto-run after Mic", isOn: $autoRunAfterMic)
-                .toggleStyle(.switch)
-
-            TextField("Goal", text: $goal, axis: .vertical)
+            TextField("Say this as text (optional)", text: $goal, axis: .vertical)
                 .lineLimit(2...4)
                 .textFieldStyle(.roundedBorder)
             TextField("Policy (spoken do’s/don’ts)", text: $policy, axis: .vertical)
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Mic → transcript → (optional) auto Run. Agent talks back. Red ring = mouse target. ⌘⇧. stops.")
+            Text("Realtime duplex voice + desktop tools. Move the mouse to pause God; say “continue” to resume. ⌘⇧. stops.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -115,7 +112,7 @@ struct ContentView: View {
             }
             ProgressView(value: Double(min(inputTokens + outputTokens, 200_000)), total: 200_000)
                 .tint(.orange)
-            Text("Projected ≈ \(costLabel) @ configured $/1M rates (env GOD_*_USD_PER_MTK). Whisper \(String(format: "%.1fs", whisperSeconds)).")
+            Text("Projected ≈ \(costLabel) @ GOD_*_USD_PER_MTK. Realtime audio billed as tokens.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -133,7 +130,7 @@ struct ContentView: View {
     private var statusColor: Color {
         switch session {
         case .idle: return .gray
-        case .listening: return voice.isRecording ? .red : .green
+        case .listening: return voice.isStreaming ? .green : .yellow
         case .acting: return .orange
         case .stopped: return .red
         }
@@ -155,13 +152,29 @@ struct ContentView: View {
                 }
                 return
             }
+            if type == "realtime_interrupt" {
+                speech.stop()
+                if let reason = payload["reason"] as? String {
+                    append("Interrupted (\(reason)).")
+                }
+                return
+            }
             if type == "speak" {
+                let format = (payload["format"] as? String) ?? "mp3"
                 if let text = payload["text"] as? String {
                     append("God: \(text)")
                 }
                 if let audio = payload["audio_base64"] as? String {
-                    speech.play(base64: audio, format: (payload["format"] as? String) ?? "mp3")
+                    if format == "pcm16" {
+                        let rate = payload["sample_rate"] as? Double ?? 24_000
+                        speech.enqueuePCM(base64: audio, sampleRate: rate)
+                    } else {
+                        speech.play(base64: audio, format: format)
+                    }
                 }
+                return
+            }
+            if payload["partial"] as? Bool == true {
                 return
             }
             if let message = payload["message"] as? String {
@@ -170,84 +183,72 @@ struct ContentView: View {
                 append(detail)
             }
         }
+
+        voice.onPCMChunk = { data in
+            Task { @MainActor in
+                guard realtimeLive, worker.ready else { return }
+                try? worker.sendUnordered(
+                    type: "realtime_audio_in",
+                    extra: ["audio_base64": data.base64EncodedString()]
+                )
+            }
+        }
     }
 
     private func append(_ line: String) {
         log.append(line)
+        if log.count > 400 {
+            log.removeFirst(log.count - 300)
+        }
     }
 
     private func startSession() async {
         busy = true
         defer { busy = false }
-        append("Starting session…")
+        append("Starting realtime session…")
         do {
             try await worker.start()
             session = .listening
             cursor.show()
-            append("Session open — worker ready.")
+            _ = try await worker.send(type: "realtime_start", extra: ["policy": policy])
+            realtimeLive = true
+            try await voice.startStreaming()
+            append("Session open — realtime mic live. Just talk.")
         } catch {
+            realtimeLive = false
+            voice.stopStreaming()
             session = .idle
             append("Start failed: \(error.localizedDescription)")
         }
     }
 
-    private func toggleMic() async {
-        if voice.isRecording {
-            busy = true
-            defer { busy = false }
-            do {
-                let data = try voice.stop()
-                append("Transcribing (\(data.count) bytes)…")
-                let response = try await worker.send(
-                    type: "transcribe",
-                    extra: [
-                        "audio_base64": data.base64EncodedString(),
-                        "format": "wav",
-                    ]
-                )
-                let text = (response["detail"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if text.isEmpty {
-                    append("Heard nothing — try again, speak clearly for 2–3 seconds.")
-                } else {
-                    goal = text
-                    append("Heard → Goal: \(text)")
-                    if autoRunAfterMic {
-                        await runGoal()
-                    }
-                }
-            } catch {
-                append("Mic failed: \(error.localizedDescription)")
-            }
+    private func toggleRealtimeMic() async {
+        if voice.isStreaming {
+            voice.stopStreaming()
+            append("Mic muted.")
             return
         }
         do {
-            try await voice.start()
-            append("Listening… speak now, then tap Stop Mic.")
+            try await voice.startStreaming()
+            append("Mic live again.")
         } catch {
             append("Mic failed: \(error.localizedDescription)")
         }
     }
 
-    private func runGoal() async {
-        if voice.isRecording {
-            _ = try? voice.stop()
-        }
+    private func sendTextGoal() async {
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            append("Goal is empty. Type one or use Mic first.")
-            return
-        }
+        guard !trimmed.isEmpty else { return }
         busy = true
         defer { busy = false }
         session = .acting
-        cursor.show()
-        append("Running goal: \(trimmed)")
+        append("You (text): \(trimmed)")
         do {
-            let final = try await worker.runAgent(goal: trimmed, policy: policy)
-            append("Final: \(final)")
+            _ = try await worker.send(type: "realtime_text", extra: ["text": trimmed])
+            goal = ""
             session = .listening
         } catch {
-            append("Agent failed: \(error.localizedDescription)")
+            append("Send failed: \(error.localizedDescription)")
             session = worker.ready ? .listening : .stopped
         }
     }
@@ -271,12 +272,12 @@ struct ContentView: View {
     private func stopSession() async {
         busy = true
         defer { busy = false }
-        if voice.isRecording {
-            _ = try? voice.stop()
-        }
+        voice.stopStreaming()
         speech.stop()
+        realtimeLive = false
         do {
             if worker.ready {
+                _ = try? await worker.send(type: "realtime_stop")
                 _ = try? await worker.send(type: "agent_stop")
                 let response = try await worker.send(type: "stop")
                 let detail = (response["detail"] as? String) ?? "released"
@@ -298,7 +299,7 @@ private enum SessionPhase {
     var label: String {
         switch self {
         case .idle: return "Idle"
-        case .listening: return "Session open"
+        case .listening: return "Realtime open"
         case .acting: return "Acting"
         case .stopped: return "Stopped"
         }

@@ -12,6 +12,7 @@ from god_worker.env import load_repo_env
 from god_worker.mouse import install_visible_mouse
 from god_worker.permissions import check_desktop
 from god_worker.protocol import handle_request, parse_line
+from god_worker.realtime_session import RealtimeSession
 from god_worker.release import release_inputs
 from god_worker.transcribe import transcribe_audio_base64
 from god_worker.usage import UsageMeter
@@ -35,11 +36,19 @@ def build_handlers(pyautogui, state: dict):
 
     def stop(_request):
         state["cancel"].set()
+        session = state.get("realtime")
+        if isinstance(session, RealtimeSession):
+            session.stop()
+            state["realtime"] = None
         release_inputs()
         return {"type": "result", "detail": "released"}
 
     def agent_stop(_request):
         state["cancel"].set()
+        session = state.get("realtime")
+        if isinstance(session, RealtimeSession):
+            session.stop()
+            state["realtime"] = None
         release_inputs()
         return {"type": "result", "detail": "agent stop requested"}
 
@@ -94,6 +103,52 @@ def build_handlers(pyautogui, state: dict):
     def usage(_request):
         return {"type": "result", "detail": "ok", **state["meter"].snapshot()}
 
+    def realtime_start(request):
+        existing = state.get("realtime")
+        if isinstance(existing, RealtimeSession) and existing.running:
+            raise RuntimeError("Realtime session already running. Stop it first.")
+        if state["thread"] is not None and state["thread"].is_alive():
+            raise RuntimeError("An agent run is in progress. Stop it first.")
+        policy = request.get("policy") if isinstance(request.get("policy"), str) else ""
+        state["cancel"].clear()
+        session = RealtimeSession(
+            policy=policy,
+            pyautogui=pyautogui,
+            emit=emit,
+            meter=state["meter"],
+            cancel=state["cancel"],
+        )
+        state["realtime"] = session
+        session.start()
+        return {"type": "ack", "detail": "realtime started"}
+
+    def realtime_stop(_request):
+        session = state.get("realtime")
+        if isinstance(session, RealtimeSession):
+            session.stop()
+            state["realtime"] = None
+        return {"type": "result", "detail": "realtime stopped"}
+
+    def realtime_audio_in(request):
+        session = state.get("realtime")
+        if not isinstance(session, RealtimeSession) or not session.running:
+            raise RuntimeError("Realtime session is not running.")
+        audio = request.get("audio_base64")
+        if not isinstance(audio, str) or not audio.strip():
+            raise RuntimeError("realtime_audio_in requires audio_base64.")
+        session.append_audio(audio)
+        return {"type": "ack", "detail": "audio queued"}
+
+    def realtime_text(request):
+        session = state.get("realtime")
+        if not isinstance(session, RealtimeSession) or not session.running:
+            raise RuntimeError("Realtime session is not running.")
+        text = request.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("realtime_text requires nonempty text.")
+        session.send_text(text.strip(), create_response=True)
+        return {"type": "ack", "detail": "text sent"}
+
     return {
         "ping": ping,
         "click_center": click_center,
@@ -102,6 +157,10 @@ def build_handlers(pyautogui, state: dict):
         "agent_stop": agent_stop,
         "transcribe": transcribe,
         "usage": usage,
+        "realtime_start": realtime_start,
+        "realtime_stop": realtime_stop,
+        "realtime_audio_in": realtime_audio_in,
+        "realtime_text": realtime_text,
     }
 
 
@@ -128,7 +187,12 @@ def main(argv: list[str] | None = None) -> int:
         emit({"type": "error", "ok": False, "error": str(error)})
         return 1
 
-    state = {"cancel": threading.Event(), "thread": None, "meter": UsageMeter()}
+    state = {
+        "cancel": threading.Event(),
+        "thread": None,
+        "meter": UsageMeter(),
+        "realtime": None,
+    }
     install_visible_mouse(pyautogui, emit)
     handlers = build_handlers(pyautogui, state)
     emit({"type": "ready", "ok": True, "detail": "god_worker ready"})

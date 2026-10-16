@@ -7,6 +7,6 @@
 	<key>CFBundleName</key>
 	<string>God</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>God records short voice commands to control your Mac.</string>
+	<string>God uses the microphone for a live realtime conversation to control your Mac.</string>
 </dict>
 </plist>

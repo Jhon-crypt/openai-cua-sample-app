@@ -173,6 +173,16 @@ final class WorkerClient: ObservableObject {
         }
     }
 
+    /// Fire-and-forget write (used for realtime PCM chunks).
+    func sendUnordered(type: String, extra: [String: Any] = [:]) throws {
+        guard stdinPipe != nil, process?.isRunning == true, ready else {
+            throw WorkerClientError.notRunning
+        }
+        var payload: [String: Any] = ["type": type, "id": UUID().uuidString]
+        for (key, value) in extra { payload[key] = value }
+        try writePayload(payload)
+    }
+
     private func writePayload(_ payload: [String: Any]) throws {
         guard let stdin = stdinPipe else { throw WorkerClientError.notRunning }
         let data = try JSONSerialization.data(withJSONObject: payload)
@@ -277,12 +287,24 @@ final class WorkerClient: ObservableObject {
         }
         if type == "agent_event" {
             onEvent?(payload)
+            if payload["partial"] as? Bool == true {
+                return
+            }
             if let message = payload["message"] as? String {
                 statusText = message
             }
             return
         }
+        if type == "speak" || type == "realtime_interrupt" || type == "mouse" || type == "usage" {
+            onEvent?(payload)
+            return
+        }
         if type == "ack" {
+            // Complete pending waiters (realtime_start / audio ack) and still forward.
+            if let id = payload["id"] as? String, let continuation = pending.removeValue(forKey: id) {
+                continuation.resume(returning: payload)
+                return
+            }
             onEvent?(payload)
             return
         }
