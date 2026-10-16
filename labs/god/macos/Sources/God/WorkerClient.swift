@@ -235,11 +235,25 @@ final class WorkerClient: ObservableObject {
         if let override = ProcessInfo.processInfo.environment["GOD_WORKER_PROJECT"] {
             return URL(fileURLWithPath: override, isDirectory: true)
         }
-        let file = URL(fileURLWithPath: #filePath)
-        return file
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+        // Walk up from this source file until we find labs/god/worker/pyproject.toml
+        // (#filePath is .../macos/Sources/God/WorkerClient.swift — need four parents to reach god/).
+        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let fm = FileManager.default
+        for _ in 0..<8 {
+            let candidate = directory.appendingPathComponent("worker", isDirectory: true)
+            let marker = candidate.appendingPathComponent("pyproject.toml")
+            if fm.fileExists(atPath: marker.path) {
+                return candidate
+            }
+            let parent = directory.deletingLastPathComponent()
+            if parent.path == directory.path { break }
+            directory = parent
+        }
+        return URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // God
+            .deletingLastPathComponent() // Sources
+            .deletingLastPathComponent() // macos
+            .deletingLastPathComponent() // god
             .appendingPathComponent("worker", isDirectory: true)
     }
 
