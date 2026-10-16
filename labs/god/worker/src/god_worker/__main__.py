@@ -7,6 +7,7 @@ import sys
 import threading
 
 from god_worker.agent_loop import run_agent_loop
+from god_worker.desktop import normalize_screenshots
 from god_worker.env import load_repo_env
 from god_worker.permissions import check_desktop
 from god_worker.protocol import handle_request, parse_line
@@ -96,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     import pyautogui
 
     pyautogui.FAILSAFE = True
+    normalize_screenshots(pyautogui)
 
     if "--check" in argv:
         try:

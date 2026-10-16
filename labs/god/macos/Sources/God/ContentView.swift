@@ -4,7 +4,7 @@ struct ContentView: View {
     @StateObject private var worker = WorkerClient()
     @StateObject private var voice = VoiceCapture()
     @State private var session: SessionPhase = .idle
-    @State private var log: [String] = ["God — type a goal or hold Mic, then Run."]
+    @State private var log: [String] = ["God — Start Session, then Mic (speak) → Stop Mic, or type a Goal → Run Goal."]
     @State private var busy = false
     @State private var goal = "Open Notes and type hello from God"
     @State private var policy = "Do not delete files. Stop if unsure."
@@ -26,15 +26,28 @@ struct ContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            if voice.isRecording {
+                Text("Recording… tap Stop Mic when finished speaking.")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+            }
+
             HStack(spacing: 10) {
                 Button("Start Session") { Task { await startSession() } }
                     .disabled(busy || session == .listening || session == .acting)
                 Button(voice.isRecording ? "Stop Mic" : "Mic") { Task { await toggleMic() } }
                     .disabled(busy || !worker.ready || session == .idle || session == .stopped)
                 Button("Run Goal") { Task { await runGoal() } }
-                    .disabled(busy || !worker.ready || goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session == .idle || session == .stopped)
+                    .disabled(
+                        busy
+                            || voice.isRecording
+                            || !worker.ready
+                            || goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || session == .idle
+                            || session == .stopped
+                    )
                 Button("Test Click") { Task { await testClick() } }
-                    .disabled(busy || !worker.ready || session == .stopped || session == .idle)
+                    .disabled(busy || voice.isRecording || !worker.ready || session == .stopped || session == .idle)
                 Button("Stop", role: .destructive) { Task { await stopSession() } }
                     .disabled(busy || session == .idle || session == .stopped)
                     .keyboardShortcut(".", modifiers: [.command, .shift])
@@ -47,7 +60,7 @@ struct ContentView: View {
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Kill switch: ⌘⇧. — Mic records a clip, then Whisper turns it into a goal.")
+            Text("Mic: speak 2–3s → Stop Mic (fills Goal) → Run Goal. Kill switch: ⌘⇧.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -82,7 +95,7 @@ struct ContentView: View {
     private var statusColor: Color {
         switch session {
         case .idle: return .gray
-        case .listening: return .green
+        case .listening: return voice.isRecording ? .red : .green
         case .acting: return .orange
         case .stopped: return .red
         }
@@ -112,20 +125,20 @@ struct ContentView: View {
             defer { busy = false }
             do {
                 let data = try voice.stop()
-                append("Transcribing…")
+                append("Transcribing (\(data.count) bytes)…")
                 let response = try await worker.send(
                     type: "transcribe",
                     extra: [
                         "audio_base64": data.base64EncodedString(),
-                        "format": "m4a",
+                        "format": "wav",
                     ]
                 )
                 let text = (response["detail"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if text.isEmpty {
-                    append("Heard nothing.")
+                    append("Heard nothing — try again, speak clearly for 2–3 seconds.")
                 } else {
                     goal = text
-                    append("Heard: \(text)")
+                    append("Heard → Goal: \(text)")
                 }
             } catch {
                 append("Mic failed: \(error.localizedDescription)")
@@ -134,19 +147,27 @@ struct ContentView: View {
         }
         do {
             try await voice.start()
-            append("Listening… tap Stop Mic when done.")
+            append("Listening… speak now, then tap Stop Mic.")
         } catch {
             append("Mic failed: \(error.localizedDescription)")
         }
     }
 
     private func runGoal() async {
+        if voice.isRecording {
+            _ = try? voice.stop()
+        }
+        let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            append("Goal is empty. Type one or use Mic first.")
+            return
+        }
         busy = true
         defer { busy = false }
         session = .acting
-        append("Running goal: \(goal)")
+        append("Running goal: \(trimmed)")
         do {
-            let final = try await worker.runAgent(goal: goal, policy: policy)
+            let final = try await worker.runAgent(goal: trimmed, policy: policy)
             append("Final: \(final)")
             session = .listening
         } catch {

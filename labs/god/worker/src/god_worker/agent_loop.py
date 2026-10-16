@@ -28,10 +28,10 @@ def build_code_tool_definitions() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": (
                             "Python for the local macOS desktop. Globals persist between calls. "
-                            "Available: pyautogui, time, log(value), display(PIL_image). "
-                            "Start with display(pyautogui.screenshot()). Use command hotkeys on macOS. "
-                            "Screenshot coordinates match PyAutoGUI input, including Retina. "
-                            "Obey any operator policy in the instructions. Do not disable the fail-safe."
+                            "Available: pyautogui, time, log(value), display(PIL_image), open_app(name). "
+                            "To launch or focus an app, call open_app('Notes') — do NOT use Spotlight typing. "
+                            "Start with display(pyautogui.screenshot()). Screenshot coordinates match clicks. "
+                            "Obey operator policy. Do not disable the fail-safe."
                         ),
                     }
                 },
@@ -141,6 +141,8 @@ def run_agent_loop(
         [
             "You are God, a personal macOS desktop operator.",
             "Use exec_py with PyAutoGUI to inspect and control the screen.",
+            "To open apps, always use open_app('AppName') (e.g. open_app('Notes')). Never rely on Spotlight.",
+            "After open_app, sleep briefly, screenshot, then type or click only if the target UI is visible.",
             "Obey the operator policy exactly when present.",
             "Prefer short action sequences, then screenshot to verify.",
             "When finished, reply with a brief final answer (no tool call).",
@@ -150,7 +152,9 @@ def run_agent_loop(
 
     import time as time_mod
 
-    namespace: dict[str, Any] = {"pyautogui": pyautogui, "time": time_mod}
+    from god_worker.desktop import open_app
+
+    namespace: dict[str, Any] = {"pyautogui": pyautogui, "time": time_mod, "open_app": open_app}
     previous_response_id: str | None = None
     next_input: Any = goal.strip()
     emit({"type": "agent_event", "level": "info", "message": f"Agent started ({chosen_model})."})
