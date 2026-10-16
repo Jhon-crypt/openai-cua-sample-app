@@ -18,7 +18,7 @@ In the HUD: **Start Session** opens a Realtime conversation (mic streams automat
 
 If you move the mouse yourself, God pauses and says to tell it when to continue. Session memory lives in the Realtime conversation for the open session.
 
-Token / $ meter uses `GOD_INPUT_USD_PER_MTK` / `GOD_OUTPUT_USD_PER_MTK`. Model/voice: `GOD_REALTIME_MODEL` (default `gpt-realtime-2.1`), `GOD_REALTIME_VOICE` (default `marin`).
+Token / $ meter uses `GOD_INPUT_USD_PER_MTK` / `GOD_OUTPUT_USD_PER_MTK`. Model/voice: `GOD_REALTIME_MODEL` (default **`gpt-realtime-2.1`** — current Realtime API model; not the old `gpt-4o-realtime-*` previews). Voice: `GOD_REALTIME_VOICE` (default `marin`). The newer **`gpt-live-1`** model uses the separate Live API (`/v1/live`), not Realtime.
 
 **Stop** / ⌘⇧. tears down Realtime and releases input. Grant Accessibility, Screen Recording, and Microphone.
 

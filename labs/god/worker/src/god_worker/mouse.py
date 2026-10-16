@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 Emit = Callable[[dict[str, Any]], None]
 
 
-def install_visible_mouse(pyautogui: Any, emit: Emit, duration: float = 0.45) -> None:
+def install_visible_mouse(pyautogui: Any, emit: Emit, duration: float = 0.65) -> None:
+    """Slow moves + HUD ring updates so the operator can watch the agent cursor."""
     pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.08
+    pyautogui.PAUSE = 0.05
     original_move = pyautogui.moveTo
     original_click = pyautogui.click
     original_drag = getattr(pyautogui, "dragTo", None)
@@ -29,9 +31,26 @@ def install_visible_mouse(pyautogui: Any, emit: Emit, duration: float = 0.45) ->
             y = kwargs.pop("y", None)
         if x is None or y is None:
             return original_move(*args, **kwargs)
-        kwargs.setdefault("duration", duration)
+        move_duration = float(kwargs.setdefault("duration", duration) or duration)
+        try:
+            cur = pyautogui.position()
+            _emit_pos(cur.x, cur.y)
+        except Exception:  # noqa: BLE001
+            pass
         _emit_pos(x, y)
-        return original_move(x, y, *args, **kwargs)
+        # Emit a few midpoints so the red ring tracks the path, not just the endpoint.
+        try:
+            steps = max(2, min(6, int(move_duration / 0.12)))
+            x0, y0 = float(pyautogui.position().x), float(pyautogui.position().y)
+            tx, ty = float(x), float(y)
+            for i in range(1, steps):
+                t = i / steps
+                _emit_pos(x0 + (tx - x0) * t, y0 + (ty - y0) * t)
+        except Exception:  # noqa: BLE001
+            pass
+        result = original_move(x, y, *args, **kwargs)
+        _emit_pos(x, y)
+        return result
 
     def click(*args, **kwargs):
         x = kwargs.pop("x", None)
@@ -42,6 +61,7 @@ def install_visible_mouse(pyautogui: Any, emit: Emit, duration: float = 0.45) ->
             args = args[2:]
         if x is not None and y is not None:
             moveTo(x, y, duration=move_duration)
+            time.sleep(0.05)
             return original_click(*args, **kwargs)
         cur = pyautogui.position()
         _emit_pos(cur.x, cur.y)
@@ -53,7 +73,7 @@ def install_visible_mouse(pyautogui: Any, emit: Emit, duration: float = 0.45) ->
     if original_drag is not None:
 
         def dragTo(*args, **kwargs):
-            kwargs.setdefault("duration", max(duration, 0.5))
+            kwargs.setdefault("duration", max(duration, 0.55))
             if len(args) >= 2:
                 _emit_pos(args[0], args[1])
             elif "x" in kwargs and "y" in kwargs:

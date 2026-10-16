@@ -1,16 +1,26 @@
 import SwiftUI
 
+private struct LogLine: Identifiable, Equatable {
+    let id: UUID
+    let text: String
+
+    init(_ text: String) {
+        self.id = UUID()
+        self.text = text
+    }
+}
+
 struct ContentView: View {
     @StateObject private var worker = WorkerClient()
     @StateObject private var voice = VoiceCapture()
     @StateObject private var speech = SpeechPlayer()
     @StateObject private var cursor = CursorOverlayController()
     @State private var session: SessionPhase = .idle
-    @State private var log: [String] = ["God — realtime voice operator. Start Session, then just talk."]
+    @State private var log: [LogLine] = [LogLine("God — realtime voice operator. Start Session, then just talk.")]
     @State private var busy = false
     @State private var realtimeLive = false
     @State private var goal = ""
-    @State private var policy = "Do not delete files. Stop if unsure."
+    @State private var policy = "Do not delete files. Stop if unsure. Prefer confirming before irreversible actions."
     @State private var inputTokens = 0
     @State private var outputTokens = 0
     @State private var costUSD = 0.0
@@ -74,22 +84,31 @@ struct ContentView: View {
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Realtime duplex voice + desktop tools. Move the mouse to pause God; say “continue” to resume. ⌘⇧. stops.")
+            Text("Any Mac app via open_app + clicks/typing. Red ring follows the agent mouse. Move mouse to pause; say “continue”. ⌘⇧. stops.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             Divider()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(log.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // Non-lazy stack + stable UUID ids — avoids ForEachChild crash when the log updates fast.
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(log) { line in
+                            Text(line.text)
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(line.id)
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+                .onChange(of: log.count) { _, _ in
+                    if let last = log.last?.id {
+                        proxy.scrollTo(last, anchor: .bottom)
                     }
                 }
             }
-            .frame(maxHeight: .infinity)
         }
         .padding(20)
         .onAppear { wireEvents() }
@@ -147,6 +166,7 @@ struct ContentView: View {
                 return
             }
             if type == "mouse" {
+                session = .acting
                 if let x = payload["x"] as? Int, let y = payload["y"] as? Int {
                     cursor.move(toX: x, y: y)
                 }
@@ -154,7 +174,7 @@ struct ContentView: View {
             }
             if type == "realtime_interrupt" {
                 speech.stop()
-                if let reason = payload["reason"] as? String {
+                if let reason = payload["reason"] as? String, reason != "speech" {
                     append("Interrupted (\(reason)).")
                 }
                 return
@@ -179,15 +199,16 @@ struct ContentView: View {
             }
             if let message = payload["message"] as? String {
                 append(message)
-            } else if let detail = payload["detail"] as? String {
+            } else if let detail = payload["detail"] as? String,
+                      detail != "audio queued",
+                      detail != "ok" {
                 append(detail)
             }
         }
 
-        // @Sendable so the audio thread can invoke this without MainActor isolation traps.
         voice.onPCMChunk = { @Sendable data in
             Task { @MainActor in
-                guard realtimeLive, worker.ready else { return }
+                guard realtimeLive, worker.ready, !speech.isSpeaking else { return }
                 try? worker.sendUnordered(
                     type: "realtime_audio_in",
                     extra: ["audio_base64": data.base64EncodedString()]
@@ -197,9 +218,11 @@ struct ContentView: View {
     }
 
     private func append(_ line: String) {
-        log.append(line)
-        if log.count > 400 {
-            log.removeFirst(log.count - 300)
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        log.append(LogLine(trimmed))
+        if log.count > 200 {
+            log.removeFirst(log.count - 150)
         }
     }
 
@@ -243,6 +266,7 @@ struct ContentView: View {
         busy = true
         defer { busy = false }
         session = .acting
+        cursor.show()
         append("You (text): \(trimmed)")
         do {
             _ = try await worker.send(type: "realtime_text", extra: ["text": trimmed])

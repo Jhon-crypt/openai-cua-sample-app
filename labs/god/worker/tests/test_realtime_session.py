@@ -7,6 +7,8 @@ def test_instructions_mention_mouse_interrupt():
     text = build_instructions("Do not delete files.")
     assert "moved the mouse" in text
     assert "Do not delete files." in text
+    assert "ANY macOS application" in text
+    assert "open_app" in text
 
 
 def test_realtime_tools_include_exec_py_without_strict():
@@ -21,5 +23,7 @@ def test_session_config_shape():
     assert cfg["type"] == "realtime"
     assert cfg["model"] == "gpt-realtime-2.1"
     assert cfg["audio"]["input"]["format"]["rate"] == 24000
+    assert cfg["audio"]["input"]["noise_reduction"]["type"] == "far_field"
+    assert cfg["audio"]["input"]["turn_detection"]["eagerness"] == "low"
     assert cfg["audio"]["output"]["voice"] == "marin"
     assert cfg["tools"][0]["name"] == "exec_py"

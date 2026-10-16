@@ -29,9 +29,10 @@ def build_code_tool_definitions() -> list[dict[str, Any]]:
                         "description": (
                             "Python for the local macOS desktop. Globals persist between calls. "
                             "Available: pyautogui, time, log(value), display(PIL_image), open_app(name). "
-                            "To launch or focus an app, call open_app('Notes') — do NOT use Spotlight typing. "
-                            "Start with display(pyautogui.screenshot()). Screenshot coordinates match clicks. "
-                            "Obey operator policy. Do not disable the fail-safe."
+                            "Works for any macOS app: open_app('Safari'), open_app('Slack'), open_app('Notes'), etc. "
+                            "Never use Spotlight. Start with display(pyautogui.screenshot()). "
+                            "Screenshot coordinates match clicks. Prefer pyautogui.moveTo before click "
+                            "so the operator sees the cursor. Obey policy. Do not disable the fail-safe."
                         ),
                     }
                 },
@@ -144,10 +145,11 @@ def run_agent_loop(
     instructions = "\n".join(
         [
             "You are God, a personal macOS desktop operator.",
+            "You can operate any macOS app (Safari, Slack, Notes, Finder, Terminal, etc.).",
             "Use exec_py with PyAutoGUI to inspect and control the screen.",
-            "To open apps, always use open_app('AppName') (e.g. open_app('Notes')). Never rely on Spotlight.",
+            "To open apps, always use open_app('AppName') (e.g. open_app('Safari')). Never rely on Spotlight.",
             "After open_app, sleep briefly, screenshot, then type or click only if the target UI is visible.",
-            "Mouse moves are intentionally slow so the operator can see them — keep actions deliberate.",
+            "Prefer moveTo before click. Mouse moves are slow so the operator can see them.",
             "Obey the operator policy exactly when present.",
             "Prefer short action sequences, then screenshot to verify.",
             "When finished, reply with a brief spoken-friendly final answer (no tool call).",

@@ -23,10 +23,13 @@ def build_instructions(policy: str) -> str:
         [
             "You are God, a personal macOS desktop operator in a live voice conversation.",
             "Speak briefly and naturally. Remember everything said in this session.",
-            "When asked to act on the Mac, call exec_py with PyAutoGUI.",
-            "To open apps, always use open_app('AppName') — never Spotlight.",
-            "After open_app, sleep briefly, screenshot, then type or click only if the UI is visible.",
-            "Mouse moves are intentionally slow so the operator can see them.",
+            "You can operate ANY macOS application the operator names (Safari, Slack, Notes,",
+            "Finder, Terminal, Chrome, Mail, Calendar, Xcode, etc.) — not just one app.",
+            "When asked to act, call exec_py with PyAutoGUI.",
+            "To launch or focus an app, always use open_app('ExactAppName') — never Spotlight.",
+            "Workflow: open_app → short sleep → display(pyautogui.screenshot()) → click/type only",
+            "when the target UI is visible. Prefer moveTo before click so the cursor is visible.",
+            "Mouse moves are intentionally slow so the operator can watch them.",
             "If you are told the operator moved the mouse, pause desktop work immediately,",
             "say: 'Seems you moved your mouse — tell me when to continue with what you're doing.',",
             "and wait until they say continue (or give a new instruction) before acting again.",
@@ -44,6 +47,8 @@ def build_realtime_tools() -> list[dict[str, Any]]:
 
 
 def session_config(policy: str, model: str, voice: str) -> dict[str, Any]:
+    # VAD: far_field NR + low eagerness reduces false barges from room noise / laptop mic.
+    # Docs: https://platform.openai.com/docs/guides/realtime-vad
     return {
         "type": "realtime",
         "model": model,
@@ -54,7 +59,13 @@ def session_config(policy: str, model: str, voice: str) -> dict[str, Any]:
         "audio": {
             "input": {
                 "format": {"type": "audio/pcm", "rate": 24000},
-                "turn_detection": {"type": "semantic_vad"},
+                "noise_reduction": {"type": "far_field"},
+                "turn_detection": {
+                    "type": "semantic_vad",
+                    "eagerness": "low",
+                    "create_response": True,
+                    "interrupt_response": True,
+                },
                 "transcription": {"model": "gpt-4o-mini-transcribe"},
             },
             "output": {

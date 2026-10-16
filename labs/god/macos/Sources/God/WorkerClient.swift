@@ -300,11 +300,15 @@ final class WorkerClient: ObservableObject {
             return
         }
         if type == "ack" {
-            // Complete pending waiters (realtime_start / audio ack) and still forward.
+            // Complete pending waiters (realtime_start etc.).
             if let id = payload["id"] as? String, let continuation = pending.removeValue(forKey: id) {
                 continuation.resume(returning: payload)
                 return
             }
+            // Fire-and-forget audio chunks return "audio queued" — never push those into the UI log
+            // (thousands/sec + ForEach(id: offset) crashed the HUD).
+            let detail = payload["detail"] as? String
+            if detail == "audio queued" { return }
             onEvent?(payload)
             return
         }
