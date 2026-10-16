@@ -9,6 +9,6 @@
   - Acceptance: `swift build` succeeds; manual click + stop
   - Verify: `cd labs/god/macos && swift build`
   - Files: `labs/god/macos/**`
-- [ ] Task: agent-loop (later)
-- [ ] Task: voice-session (later)
+- [x] Task: agent-loop (Responses + exec_py in worker; HUD Run Goal)
+- [x] Task: voice-session (Mic → Whisper → goal field)
 - [ ] Task: session-log (later)

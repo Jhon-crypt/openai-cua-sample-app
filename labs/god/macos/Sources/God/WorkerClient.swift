@@ -18,12 +18,14 @@ enum WorkerClientError: LocalizedError {
 final class WorkerClient: ObservableObject {
     @Published private(set) var statusText = "Disconnected"
     @Published private(set) var ready = false
+    var onEvent: (([String: Any]) -> Void)?
 
     private var process: Process?
     private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
+    private var agentCompletions: [String: CheckedContinuation<String, Error>] = [:]
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var buffer = Data()
     private var stderrText = ""
@@ -129,25 +131,54 @@ final class WorkerClient: ObservableObject {
         handleTermination(exitCode: running?.terminationStatus)
     }
 
-    func send(type: String) async throws -> [String: Any] {
-        guard let stdin = stdinPipe, process?.isRunning == true, ready else {
+    func send(type: String, extra: [String: Any] = [:]) async throws -> [String: Any] {
+        guard stdinPipe != nil, process?.isRunning == true, ready else {
             throw WorkerClientError.notRunning
         }
         let id = UUID().uuidString
-        let payload: [String: Any] = ["type": type, "id": id]
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        var line = data
-        line.append(0x0A)
+        var payload: [String: Any] = ["type": type, "id": id]
+        for (key, value) in extra { payload[key] = value }
 
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             do {
-                try stdin.fileHandleForWriting.write(contentsOf: line)
+                try writePayload(payload)
             } catch {
                 pending.removeValue(forKey: id)
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    func runAgent(goal: String, policy: String = "", maxTurns: Int = 12) async throws -> String {
+        guard stdinPipe != nil, process?.isRunning == true, ready else {
+            throw WorkerClientError.notRunning
+        }
+        let id = UUID().uuidString
+        let payload: [String: Any] = [
+            "type": "agent_run",
+            "id": id,
+            "goal": goal,
+            "policy": policy,
+            "max_turns": maxTurns,
+        ]
+        return try await withCheckedThrowingContinuation { continuation in
+            agentCompletions[id] = continuation
+            do {
+                try writePayload(payload)
+            } catch {
+                agentCompletions.removeValue(forKey: id)
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func writePayload(_ payload: [String: Any]) throws {
+        guard let stdin = stdinPipe else { throw WorkerClientError.notRunning }
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        var line = data
+        line.append(0x0A)
+        try stdin.fileHandleForWriting.write(contentsOf: line)
     }
 
     private func attachReaders(stdout: Pipe, stderr: Pipe) {
@@ -221,6 +252,10 @@ final class WorkerClient: ObservableObject {
             continuation.resume(throwing: WorkerClientError.notRunning)
         }
         pending.removeAll()
+        for (_, continuation) in agentCompletions {
+            continuation.resume(throwing: WorkerClientError.notRunning)
+        }
+        agentCompletions.removeAll()
     }
 
     private func handleLine(_ lineData: Data) {
@@ -240,6 +275,17 @@ final class WorkerClient: ObservableObject {
             readyContinuation = nil
             return
         }
+        if type == "agent_event" {
+            onEvent?(payload)
+            if let message = payload["message"] as? String {
+                statusText = message
+            }
+            return
+        }
+        if type == "ack" {
+            onEvent?(payload)
+            return
+        }
         if type == "error", payload["id"] == nil {
             let message = (payload["error"] as? String) ?? "unknown"
             statusText = "Error: \(message)"
@@ -249,8 +295,22 @@ final class WorkerClient: ObservableObject {
             readyContinuation = nil
             return
         }
-        if let id = payload["id"] as? String, let continuation = pending.removeValue(forKey: id) {
-            continuation.resume(returning: payload)
+        if let id = payload["id"] as? String {
+            if let agentWait = agentCompletions.removeValue(forKey: id) {
+                if type == "error" || payload["ok"] as? Bool == false {
+                    agentWait.resume(throwing: WorkerClientError.spawnFailed((payload["error"] as? String) ?? "agent failed"))
+                } else {
+                    agentWait.resume(returning: (payload["detail"] as? String) ?? "done")
+                }
+                return
+            }
+            if let continuation = pending.removeValue(forKey: id) {
+                if type == "error" || payload["ok"] as? Bool == false {
+                    continuation.resume(throwing: WorkerClientError.spawnFailed((payload["error"] as? String) ?? "request failed"))
+                } else {
+                    continuation.resume(returning: payload)
+                }
+            }
         }
     }
 
@@ -327,6 +387,39 @@ final class WorkerClient: ObservableObject {
         }
         env["PATH"] = merged.joined(separator: ":")
         env["PYTHONUNBUFFERED"] = "1"
+        for (key, value) in loadDotEnv() {
+            if env[key] == nil || env[key]?.isEmpty == true {
+                env[key] = value
+            }
+        }
         return env
+    }
+
+    static func loadDotEnv() -> [String: String] {
+        let worker = workerProjectURL()
+        let rootEnv = worker.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".env")
+        // labs/god/worker -> labs/god -> labs -> repo root is one more up from god
+        let candidates = [
+            worker.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".env"),
+            rootEnv,
+            worker.appendingPathComponent(".env"),
+        ]
+        var values: [String: String] = [:]
+        for url in candidates {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for raw in text.split(separator: "\n") {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.isEmpty || line.hasPrefix("#") || !line.contains("=") { continue }
+                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+                guard parts.count == 2 else { continue }
+                var value = parts[1].trimmingCharacters(in: .whitespaces)
+                if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                    value = String(value.dropFirst().dropLast())
+                }
+                values[parts[0].trimmingCharacters(in: .whitespaces)] = value
+            }
+            if values["OPENAI_API_KEY"] != nil { break }
+        }
+        return values
     }
 }

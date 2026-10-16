@@ -10,7 +10,22 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "God",
-            path: "Sources/God"
+            path: "Sources/God",
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/God/Info.plist",
+                ], .when(configuration: .debug)),
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/God/Info.plist",
+                ], .when(configuration: .release)),
+            ]
         ),
     ]
 )

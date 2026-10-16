@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Desktop input worker for the God Mac operator"
 requires-python = ">=3.10"
 dependencies = [
+  "openai>=2,<3",
+  "pillow>=10",
   "pyautogui>=0.9.54",
   "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
 ]
