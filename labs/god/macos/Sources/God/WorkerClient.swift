@@ -22,33 +22,68 @@ final class WorkerClient: ObservableObject {
     private var process: Process?
     private var stdinPipe: Pipe?
     private var readTask: Task<Void, Never>?
+    private var stderrTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var buffer = Data()
+    private var stderrText = ""
+    private var sawReady = false
 
     func start() async throws {
         if process?.isRunning == true, ready { return }
         stopWorker()
 
         let workerProject = Self.workerProjectURL()
+        guard FileManager.default.fileExists(atPath: workerProject.appendingPathComponent("pyproject.toml").path) else {
+            throw WorkerClientError.spawnFailed("Worker project missing at \(workerProject.path)")
+        }
+
+        let uv = Self.resolveUvURL()
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
+        let stderr = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            "uv", "run", "--project", workerProject.path, "python", "-m", "god_worker",
-        ]
+        process.executableURL = uv
+        process.arguments = ["run", "--project", workerProject.path, "python", "-m", "god_worker"]
+        process.environment = Self.workerEnvironment()
         process.standardInput = stdin
         process.standardOutput = stdout
-        process.standardError = Pipe()
-        process.terminationHandler = { [weak self] _ in
-            Task { @MainActor in self?.handleTermination() }
+        process.standardError = stderr
+        process.terminationHandler = { [weak self] proc in
+            Task { @MainActor in self?.handleTermination(exitCode: proc.terminationStatus) }
+        }
+
+        sawReady = false
+        stderrText = ""
+        readyContinuation = nil
+
+        // Register waiter before run() so an early "ready" line cannot be missed.
+        let readyWait = Task { @MainActor in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if self.sawReady {
+                    continuation.resume()
+                    return
+                }
+                self.readyContinuation = continuation
+            }
+        }
+
+        let timeout = Task { @MainActor in
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+            if let pendingReady = self.readyContinuation {
+                self.readyContinuation = nil
+                let detail = self.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let message = detail.isEmpty ? "Timed out waiting for the worker." : detail
+                pendingReady.resume(throwing: WorkerClientError.spawnFailed(message))
+            }
         }
 
         do {
             try process.run()
         } catch {
+            timeout.cancel()
+            readyWait.cancel()
             throw WorkerClientError.spawnFailed(error.localizedDescription)
         }
 
@@ -58,21 +93,21 @@ final class WorkerClient: ObservableObject {
         self.ready = false
 
         readTask = Task { await self.readLoop(handle: stdout.fileHandleForReading) }
+        stderrTask = Task { await self.readStderr(handle: stderr.fileHandleForReading) }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.readyContinuation = continuation
-            Task {
-                try await Task.sleep(nanoseconds: 60_000_000_000)
-                if let pendingReady = self.readyContinuation {
-                    self.readyContinuation = nil
-                    pendingReady.resume(throwing: WorkerClientError.timeout)
-                }
-            }
+        do {
+            try await readyWait.value
+            timeout.cancel()
+        } catch {
+            timeout.cancel()
+            stopWorker()
+            throw error
         }
     }
 
     func stopWorker() {
-        if process?.isRunning == true {
+        let running = process
+        if running?.isRunning == true {
             if let stdin = stdinPipe {
                 let payload: [String: Any] = ["type": "stop", "id": "shutdown"]
                 if let data = try? JSONSerialization.data(withJSONObject: payload) {
@@ -82,10 +117,11 @@ final class WorkerClient: ObservableObject {
                     Thread.sleep(forTimeInterval: 0.15)
                 }
             }
-            process?.terminate()
+            running?.terminate()
         }
         readTask?.cancel()
-        handleTermination()
+        stderrTask?.cancel()
+        handleTermination(exitCode: running?.terminationStatus)
     }
 
     func send(type: String) async throws -> [String: Any] {
@@ -109,15 +145,25 @@ final class WorkerClient: ObservableObject {
         }
     }
 
-    private func handleTermination() {
+    private func handleTermination(exitCode: Int32?) {
+        let wasWaiting = readyContinuation != nil
         ready = false
-        statusText = "Disconnected"
         process = nil
         stdinPipe = nil
+
         if let readyContinuation {
             self.readyContinuation = nil
-            readyContinuation.resume(throwing: WorkerClientError.notRunning)
+            let detail = stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let code = exitCode.map(String.init) ?? "?"
+            let message = detail.isEmpty
+                ? "Worker exited before ready (code \(code)). Is uv installed?"
+                : "Worker exited (code \(code)): \(detail)"
+            statusText = message
+            readyContinuation.resume(throwing: WorkerClientError.spawnFailed(message))
+        } else if !wasWaiting {
+            statusText = "Disconnected"
         }
+
         for (_, continuation) in pending {
             continuation.resume(throwing: WorkerClientError.notRunning)
         }
@@ -141,6 +187,23 @@ final class WorkerClient: ObservableObject {
         }
     }
 
+    private func readStderr(handle: FileHandle) async {
+        while !Task.isCancelled {
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                if process?.isRunning != true { break }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                continue
+            }
+            if let text = String(data: chunk, encoding: .utf8) {
+                stderrText += text
+                if stderrText.count > 8_000 {
+                    stderrText = String(stderrText.suffix(4_000))
+                }
+            }
+        }
+    }
+
     private func handleLine(_ lineData: Data) {
         guard !lineData.isEmpty,
               let object = try? JSONSerialization.jsonObject(with: lineData),
@@ -149,6 +212,7 @@ final class WorkerClient: ObservableObject {
 
         let type = payload["type"] as? String
         if type == "ready" {
+            sawReady = true
             ready = true
             statusText = (payload["detail"] as? String) ?? "Ready"
             readyContinuation?.resume()
@@ -177,5 +241,34 @@ final class WorkerClient: ObservableObject {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("worker", isDirectory: true)
+    }
+
+    static func resolveUvURL() -> URL {
+        if let override = ProcessInfo.processInfo.environment["GOD_UV"] {
+            return URL(fileURLWithPath: override)
+        }
+        let candidates = [
+            "/opt/homebrew/bin/uv",
+            "/usr/local/bin/uv",
+            "\(NSHomeDirectory())/.local/bin/uv",
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: "/opt/homebrew/bin/uv")
+    }
+
+    static func workerEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let extras = ["/opt/homebrew/bin", "/usr/local/bin", "\(NSHomeDirectory())/.local/bin"]
+        let existing = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        var merged: [String] = []
+        for part in extras + existing where !part.isEmpty && seen.insert(part).inserted {
+            merged.append(part)
+        }
+        env["PATH"] = merged.joined(separator: ":")
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
     }
 }
