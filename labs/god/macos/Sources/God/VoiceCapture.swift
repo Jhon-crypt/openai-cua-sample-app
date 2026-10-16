@@ -24,23 +24,87 @@ enum VoiceCaptureError: LocalizedError {
     }
 }
 
+/// Holds tap state off the main actor — AVAudioEngine taps run on a realtime audio thread
+/// and must not touch `@MainActor` objects (Swift traps with `_dispatch_assert_queue_fail`).
+private final class PCMStreamCore: @unchecked Sendable {
+    let converter: AVAudioConverter
+    let targetFormat: AVAudioFormat
+    let inputSampleRate: Double
+    private let lock = NSLock()
+    private var onChunk: ((Data) -> Void)?
+
+    init(
+        converter: AVAudioConverter,
+        targetFormat: AVAudioFormat,
+        inputSampleRate: Double,
+        onChunk: ((Data) -> Void)?
+    ) {
+        self.converter = converter
+        self.targetFormat = targetFormat
+        self.inputSampleRate = inputSampleRate
+        self.onChunk = onChunk
+    }
+
+    func setOnChunk(_ handler: ((Data) -> Void)?) {
+        lock.lock()
+        onChunk = handler
+        lock.unlock()
+    }
+
+    func handle(_ buffer: AVAudioPCMBuffer) {
+        let ratio = targetFormat.sampleRate / inputSampleRate
+        let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
+
+        let consumed = ConsumedFlag()
+        var error: NSError?
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if consumed.value {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed.value = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        converter.convert(to: outBuffer, error: &error, withInputFrom: inputBlock)
+        guard error == nil, outBuffer.frameLength > 0,
+              let channels = outBuffer.int16ChannelData else { return }
+
+        let byteCount = Int(outBuffer.frameLength) * MemoryLayout<Int16>.size
+        let data = Data(bytes: channels[0], count: byteCount)
+
+        lock.lock()
+        let handler = onChunk
+        lock.unlock()
+        handler?(data)
+    }
+}
+
+private final class ConsumedFlag: @unchecked Sendable {
+    var value = false
+}
+
 @MainActor
 final class VoiceCapture: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isStreaming = false
 
-    /// Called off the main actor with raw pcm16 mono @ 24 kHz chunks.
-    var onPCMChunk: ((Data) -> Void)?
+    /// Invoked from the audio thread with raw pcm16 mono @ 24 kHz chunks.
+    /// Handler must hop to the main actor before touching UI / WorkerClient.
+    var onPCMChunk: ((Data) -> Void)? {
+        didSet { streamCore?.setOnChunk(onPCMChunk) }
+    }
 
     private var recorder: AVAudioRecorder?
     private var fileURL: URL?
     private var startedAt: Date?
 
     private var engine: AVAudioEngine?
-    private var converter: AVAudioConverter?
+    private var streamCore: PCMStreamCore?
     private let targetSampleRate: Double = 24_000
 
-    // MARK: - Legacy short WAV capture (Whisper / Run Goal path)
+    // MARK: - Legacy short WAV capture
 
     func start() async throws {
         let granted = await requestPermission()
@@ -114,33 +178,23 @@ final class VoiceCapture: ObservableObject {
             throw VoiceCaptureError.engineUnavailable
         }
 
-        let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-        self.converter = converter
+        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+            throw VoiceCaptureError.engineUnavailable
+        }
+
+        let core = PCMStreamCore(
+            converter: converter,
+            targetFormat: targetFormat,
+            inputSampleRate: inputFormat.sampleRate,
+            onChunk: onPCMChunk
+        )
+        streamCore = core
         self.engine = engine
 
-        let bufferSize: AVAudioFrameCount = 2_400 // ~100ms at 24 kHz after convert
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let converter = self.converter else { return }
-            let ratio = targetFormat.sampleRate / inputFormat.sampleRate
-            let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
-            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
-            var error: NSError?
-            let consumedFlag = ConsumedFlag()
-            let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-                if consumedFlag.value {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-                consumedFlag.value = true
-                outStatus.pointee = .haveData
-                return buffer
-            }
-            converter.convert(to: outBuffer, error: &error, withInputFrom: inputBlock)
-            guard error == nil, outBuffer.frameLength > 0,
-                  let channels = outBuffer.int16ChannelData else { return }
-            let byteCount = Int(outBuffer.frameLength) * MemoryLayout<Int16>.size
-            let data = Data(bytes: channels[0], count: byteCount)
-            self.onPCMChunk?(data)
+        let bufferSize: AVAudioFrameCount = 2_400
+        // Capture only the nonisolated core — never `self` (MainActor).
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { buffer, _ in
+            core.handle(buffer)
         }
 
         do {
@@ -148,7 +202,7 @@ final class VoiceCapture: ObservableObject {
         } catch {
             input.removeTap(onBus: 0)
             self.engine = nil
-            self.converter = nil
+            self.streamCore = nil
             throw VoiceCaptureError.engineUnavailable
         }
         isStreaming = true
@@ -159,7 +213,7 @@ final class VoiceCapture: ObservableObject {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
-        converter = nil
+        streamCore = nil
         isStreaming = false
     }
 
@@ -170,9 +224,4 @@ final class VoiceCapture: ObservableObject {
             }
         }
     }
-}
-
-/// Tiny flag box so AVAudioConverterInputBlock can mutate without capturing a var.
-private final class ConsumedFlag: @unchecked Sendable {
-    var value = false
 }
