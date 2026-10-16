@@ -14,8 +14,10 @@ uv run --project labs/god/worker pytest
 cd labs/god/macos && swift run God
 ```
 
-In the HUD: **Start Session** → type a **Goal** (or **Mic** → Stop Mic) → **Run Goal**. **Stop** / ⌘⇧. kills the agent and releases input.
+In the HUD: **Start Session** → **Mic** (auto-runs) or type a **Goal** → **Run Goal**.
 
-Grant Accessibility, Screen Recording, and Microphone to Terminal / God.
+You’ll see a **red cursor ring**, hear the agent **talk back** (TTS), and a **token / $ meter** (rates via `GOD_INPUT_USD_PER_MTK`, `GOD_OUTPUT_USD_PER_MTK`, `GOD_WHISPER_USD_PER_MIN`).
+
+**Stop** / ⌘⇧. kills the agent and releases input. Grant Accessibility, Screen Recording, and Microphone.
 
 Docs: [SPEC.md](SPEC.md) · [CAPABILITY-MAP.md](CAPABILITY-MAP.md) · [SPEC-agent-loop.md](SPEC-agent-loop.md) · [SPEC-voice-session.md](SPEC-voice-session.md)

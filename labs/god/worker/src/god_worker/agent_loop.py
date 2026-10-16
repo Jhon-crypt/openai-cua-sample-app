@@ -128,12 +128,16 @@ def run_agent_loop(
     cancel: threading.Event,
     max_turns: int = 12,
     model: str | None = None,
+    meter: Any | None = None,
+    talk: bool = True,
 ) -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing. Set it in the repo .env file.")
 
     from openai import OpenAI
+
+    from god_worker.speech import speak
 
     client = OpenAI(api_key=api_key)
     chosen_model = model or os.environ.get("CUA_DEFAULT_MODEL") or "gpt-6-astra"
@@ -143,9 +147,10 @@ def run_agent_loop(
             "Use exec_py with PyAutoGUI to inspect and control the screen.",
             "To open apps, always use open_app('AppName') (e.g. open_app('Notes')). Never rely on Spotlight.",
             "After open_app, sleep briefly, screenshot, then type or click only if the target UI is visible.",
+            "Mouse moves are intentionally slow so the operator can see them — keep actions deliberate.",
             "Obey the operator policy exactly when present.",
             "Prefer short action sequences, then screenshot to verify.",
-            "When finished, reply with a brief final answer (no tool call).",
+            "When finished, reply with a brief spoken-friendly final answer (no tool call).",
             f"Operator policy:\n{policy.strip() or '(none — follow the goal safely)'}",
         ]
     )
@@ -158,6 +163,8 @@ def run_agent_loop(
     previous_response_id: str | None = None
     next_input: Any = goal.strip()
     emit({"type": "agent_event", "level": "info", "message": f"Agent started ({chosen_model})."})
+    if talk:
+        speak(client, f"On it. {goal[:120]}", emit)
 
     for turn in range(1, max_turns + 1):
         if cancel.is_set():
@@ -178,13 +185,19 @@ def run_agent_loop(
         response_obj = client.responses.create(**request)
         response = response_obj.model_dump(exclude_none=True)
         previous_response_id = response["id"]
+        if meter is not None:
+            emit(meter.add_response_usage(response.get("usage")))
         classified = classify_response(response)
 
         if classified.get("commentary"):
             emit({"type": "agent_event", "level": "info", "message": classified["commentary"]})
+            if talk:
+                speak(client, classified["commentary"], emit)
 
         if classified["kind"] == "final":
             emit({"type": "agent_event", "level": "ok", "message": classified["text"]})
+            if talk:
+                speak(client, classified["text"], emit)
             return classified["text"]
         if classified["kind"] == "commentary":
             next_input = []

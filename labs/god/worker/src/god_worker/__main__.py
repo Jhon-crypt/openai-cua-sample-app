@@ -9,10 +9,12 @@ import threading
 from god_worker.agent_loop import run_agent_loop
 from god_worker.desktop import normalize_screenshots
 from god_worker.env import load_repo_env
+from god_worker.mouse import install_visible_mouse
 from god_worker.permissions import check_desktop
 from god_worker.protocol import handle_request, parse_line
 from god_worker.release import release_inputs
 from god_worker.transcribe import transcribe_audio_base64
+from god_worker.usage import UsageMeter
 
 
 def emit(payload: dict) -> None:
@@ -49,6 +51,7 @@ def build_handlers(pyautogui, state: dict):
             raise RuntimeError("agent_run requires a nonempty goal string.")
         policy = request.get("policy") if isinstance(request.get("policy"), str) else ""
         max_turns = int(request.get("max_turns") or 12)
+        talk = request.get("talk", True) is not False
         run_id = request.get("id")
         state["cancel"].clear()
 
@@ -61,7 +64,10 @@ def build_handlers(pyautogui, state: dict):
                     emit=emit,
                     cancel=state["cancel"],
                     max_turns=max_turns,
+                    meter=state["meter"],
+                    talk=talk,
                 )
+                emit(state["meter"].snapshot())
                 emit({"type": "result", "id": run_id, "ok": True, "detail": final})
             except Exception as error:  # noqa: BLE001
                 emit({"type": "error", "id": run_id, "ok": False, "error": str(error)})
@@ -77,9 +83,16 @@ def build_handlers(pyautogui, state: dict):
         audio = request.get("audio_base64")
         if not isinstance(audio, str) or not audio.strip():
             raise RuntimeError("transcribe requires audio_base64.")
-        fmt = request.get("format") if isinstance(request.get("format"), str) else "m4a"
+        fmt = request.get("format") if isinstance(request.get("format"), str) else "wav"
+        import base64
+
+        raw = base64.b64decode(audio)
+        emit(state["meter"].add_whisper_bytes(len(raw)))
         text = transcribe_audio_base64(audio, fmt=fmt)
         return {"type": "result", "detail": text}
+
+    def usage(_request):
+        return {"type": "result", "detail": "ok", **state["meter"].snapshot()}
 
     return {
         "ping": ping,
@@ -88,6 +101,7 @@ def build_handlers(pyautogui, state: dict):
         "agent_run": agent_run,
         "agent_stop": agent_stop,
         "transcribe": transcribe,
+        "usage": usage,
     }
 
 
@@ -114,9 +128,11 @@ def main(argv: list[str] | None = None) -> int:
         emit({"type": "error", "ok": False, "error": str(error)})
         return 1
 
-    state = {"cancel": threading.Event(), "thread": None}
+    state = {"cancel": threading.Event(), "thread": None, "meter": UsageMeter()}
+    install_visible_mouse(pyautogui, emit)
     handlers = build_handlers(pyautogui, state)
     emit({"type": "ready", "ok": True, "detail": "god_worker ready"})
+    emit(state["meter"].snapshot())
 
     for raw in sys.stdin:
         line = raw.strip()
