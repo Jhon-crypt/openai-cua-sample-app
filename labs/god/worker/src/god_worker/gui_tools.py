@@ -11,6 +11,7 @@ from typing import Any, Callable
 from god_worker.agent_loop import build_code_tool_definitions, execute_code
 from god_worker.desktop import open_app
 from god_worker.grounding import ax_find_elements, map_image_to_screen, ocr_find_text
+from god_worker.mouse import agent_mouse_section
 
 Emit = Callable[[dict[str, Any]], None]
 
@@ -186,7 +187,12 @@ class DesktopHarness:
         handler = handlers.get(name)
         if handler is None:
             return {"ok": False, "error": f"Unknown tool: {name}"}
+        # Own the whole tool call so chained move→click isn't mistaken for the operator.
+        mouse_tools = {"click", "click_text", "click_element", "type_text", "hotkey", "exec_py"}
         try:
+            if name in mouse_tools:
+                with agent_mouse_section(settle_s=0.45):
+                    return handler(arguments)
             return handler(arguments)
         except Exception as error:  # noqa: BLE001
             return {"ok": False, "error": str(error), "tool": name}

@@ -15,6 +15,7 @@ from god_worker.gui_tools import (
     extract_verify_image,
     tool_result_for_model,
 )
+from god_worker.mouse import is_agent_controlling_mouse
 from god_worker.stuck import StuckDetector
 
 Emit = Callable[[dict[str, Any]], None]
@@ -111,7 +112,6 @@ class RealtimeSession:
         self._stop = threading.Event()
         self._connection: Any | None = None
         self._conn_lock = threading.Lock()
-        self._agent_moving_until = 0.0
         self._awaiting_continue = False
         self._last_interrupt_at = 0.0
         self._paused = False
@@ -137,7 +137,6 @@ class RealtimeSession:
         self._context = ContextManager()
         self._stuck = StuckDetector()
         self._actions_frozen = False
-        self._wrap_agent_moves()
         self._stop.clear()
         self.cancel.clear()
         self._thread = threading.Thread(target=self._run, name="god-realtime", daemon=True)
@@ -190,16 +189,6 @@ class RealtimeSession:
         )
         if create_response:
             conn.response.create()
-
-    def _wrap_agent_moves(self) -> None:
-        original = self.pyautogui.moveTo
-
-        def move_to(*args: Any, **kwargs: Any) -> Any:
-            duration = float(kwargs.get("duration", 0.65) or 0.65)
-            self._agent_moving_until = time.time() + duration + 0.35
-            return original(*args, **kwargs)
-
-        self.pyautogui.moveTo = move_to
 
     def _refresh_session_instructions(self, connection: Any) -> None:
         plan = self._harness.plan if self._harness else ""
@@ -537,7 +526,8 @@ class RealtimeSession:
             last = pos
             if not moved:
                 continue
-            if time.time() < self._agent_moving_until:
+            # Agent-owned motion (visible mouse / tool section) must never look like the operator.
+            if is_agent_controlling_mouse():
                 continue
             now = time.time()
             if now - self._last_interrupt_at < MOUSE_INTERRUPT_COOLDOWN_S:
