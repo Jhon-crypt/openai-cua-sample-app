@@ -40,6 +40,11 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var pcmFormat: AVAudioFormat?
     private var scheduledBuffers = 0
 
+    /// Required for `@StateObject` under Swift 6 / macOS 26 — MainActor-isolated init crashes body eval.
+    nonisolated override init() {
+        super.init()
+    }
+
     nonisolated func shouldSuppressMic() -> Bool {
         suppressMic.get()
     }

@@ -121,6 +121,9 @@ final class VoiceCapture: ObservableObject {
     private var streamCore: PCMStreamCore?
     private let targetSampleRate: Double = 24_000
 
+    /// Required for `@StateObject` under Swift 6 / macOS 26 — MainActor-isolated init crashes body eval.
+    nonisolated init() {}
+
     // MARK: - Legacy short WAV capture
 
     func start() async throws {

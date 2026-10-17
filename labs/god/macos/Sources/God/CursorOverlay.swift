@@ -8,6 +8,9 @@ final class CursorOverlayController: ObservableObject {
     private var window: NSWindow?
     private var hosting: NSHostingView<CursorRingView>?
 
+    /// Required for `@StateObject` under Swift 6 / macOS 26 — MainActor-isolated init crashes body eval.
+    nonisolated init() {}
+
     func show() {
         if window != nil { return }
         let view = CursorRingView(controller: self)

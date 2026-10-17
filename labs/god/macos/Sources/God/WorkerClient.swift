@@ -72,6 +72,9 @@ final class WorkerClient: ObservableObject {
     private var sawReady = false
     private var timeoutTask: Task<Void, Never>?
 
+    /// Required for `@StateObject` under Swift 6 / macOS 26 — MainActor-isolated init crashes body eval.
+    nonisolated init() {}
+
     func start() async throws {
         if process?.isRunning == true, ready { return }
         stopWorker()

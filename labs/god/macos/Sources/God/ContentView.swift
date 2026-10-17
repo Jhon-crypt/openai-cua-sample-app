@@ -11,10 +11,10 @@ private struct LogLine: Identifiable, Equatable {
 }
 
 struct ContentView: View {
-    @StateObject private var worker = WorkerClient()
-    @StateObject private var voice = VoiceCapture()
-    @StateObject private var speech = SpeechPlayer()
-    @StateObject private var cursor = CursorOverlayController()
+    @StateObject private var worker: WorkerClient
+    @StateObject private var voice: VoiceCapture
+    @StateObject private var speech: SpeechPlayer
+    @StateObject private var cursor: CursorOverlayController
     @State private var session: SessionPhase = .idle
     @State private var log: [LogLine] = [LogLine("God — realtime voice operator. Start Session, then just talk.")]
     @State private var busy = false
@@ -25,6 +25,13 @@ struct ContentView: View {
     @State private var outputTokens = 0
     @State private var costUSD = 0.0
     @State private var whisperSeconds = 0.0
+
+    init() {
+        _worker = StateObject(wrappedValue: WorkerClient())
+        _voice = StateObject(wrappedValue: VoiceCapture())
+        _speech = StateObject(wrappedValue: SpeechPlayer())
+        _cursor = StateObject(wrappedValue: CursorOverlayController())
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
