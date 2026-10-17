@@ -25,6 +25,8 @@ struct ContentView: View {
     @State private var outputTokens = 0
     @State private var costUSD = 0.0
     @State private var whisperSeconds = 0.0
+    /// Shared with the mic callback — drops noise-floor audio before Realtime VAD sees it.
+    private let micGate = MicEnergyGate()
 
     init() {
         _worker = StateObject(wrappedValue: WorkerClient())
@@ -182,8 +184,12 @@ struct ContentView: View {
             if type == "realtime_interrupt" {
                 let reason = payload["reason"] as? String
                 // Mouse pause only freezes desktop tools — don't chop mid-sentence audio.
-                // Speech barge-in (real operator talk) still stops local playback.
-                if reason != "mouse" {
+                // Speech barge-in only if the energy gate recently saw real voice (not Mac noise).
+                if reason == "speech" {
+                    if micGate.wasOpenRecently() {
+                        speech.stop()
+                    }
+                } else if reason != "mouse" {
                     speech.stop()
                 }
                 if let reason, reason != "speech" {
@@ -218,12 +224,13 @@ struct ContentView: View {
             }
         }
 
-        // Off-MainActor path: drop chunks while local audio plays (echo → VAD barge-in → cutoff),
-        // and write stdin without Task-per-chunk (that flooded MainActor and crashed the HUD).
+        // Off-MainActor path: duck on speakers, RMS-gate noise, write stdin without Task-per-chunk.
         let ingress = worker.audioIngress
         let player = speech
+        let gate = micGate
         voice.onPCMChunk = { @Sendable data in
             if player.shouldSuppressMic() { return }
+            guard gate.allow(data, godSpeaking: player.isPlaybackActive()) else { return }
             ingress.sendPCMBase64(data.base64EncodedString())
         }
     }
@@ -248,6 +255,7 @@ struct ContentView: View {
             _ = try await worker.send(type: "realtime_start", extra: ["policy": policy])
             realtimeLive = true
             worker.setRealtimeAudioEnabled(true)
+            micGate.reset()
             try await voice.startStreaming()
             append("Session open — realtime mic live. Just talk.")
         } catch {
@@ -312,6 +320,7 @@ struct ContentView: View {
         defer { busy = false }
         voice.stopStreaming()
         speech.stop()
+        micGate.reset()
         realtimeLive = false
         worker.setRealtimeAudioEnabled(false)
         do {

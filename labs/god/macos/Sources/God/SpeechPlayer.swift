@@ -30,6 +30,8 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     /// Only used on speaker output. Headphones/BT skip this so duplex stays open.
     private let suppressMic = AtomicBool(false)
+    /// True while local God audio is playing (even on headphones where mic is not ducked).
+    private let playbackActive = AtomicBool(false)
     private var hangoverTask: Task<Void, Never>?
     private var speakingWatchdog: Task<Void, Never>?
     private var lastEnqueueAt = Date.distantPast
@@ -47,6 +49,10 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     nonisolated func shouldSuppressMic() -> Bool {
         suppressMic.get()
+    }
+
+    nonisolated func isPlaybackActive() -> Bool {
+        playbackActive.get()
     }
 
     // MARK: - File / compressed (mp3 TTS)
@@ -121,6 +127,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func markSpeaking() {
         isSpeaking = true
+        playbackActive.set(true)
         // Headphones/BT: no speaker bleed — keep mic open so operator can barge in / reply.
         if OutputRoute.shouldDuckMicForEcho() {
             suppressMic.set(true)
@@ -131,6 +138,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func clearSpeakingAfterHangover() {
         isSpeaking = false
+        playbackActive.set(false)
         guard OutputRoute.shouldDuckMicForEcho() else {
             suppressMic.set(false)
             return
@@ -163,6 +171,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func forceMicOpen() {
         isSpeaking = false
+        playbackActive.set(false)
         suppressMic.set(false)
     }
 
