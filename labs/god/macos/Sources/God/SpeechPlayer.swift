@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 
 /// Thread-safe bool readable from the audio capture path (off MainActor).
@@ -27,10 +28,11 @@ private final class AtomicBool: @unchecked Sendable {
 final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isSpeaking = false
 
-    /// Mic must stay muted while we play (+ hangover) or speaker echo barges in and cuts God off.
+    /// Only used on speaker output. Headphones/BT skip this so duplex stays open.
     private let suppressMic = AtomicBool(false)
     private var hangoverTask: Task<Void, Never>?
     private var speakingWatchdog: Task<Void, Never>?
+    private var lastEnqueueAt = Date.distantPast
 
     private var player: AVAudioPlayer?
     private var engine: AVAudioEngine?
@@ -58,8 +60,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             self.player = player
             markSpeaking()
             player.play()
+            bumpSpeakingWatchdog()
         } catch {
-            clearSpeakingAfterHangover(immediate: true)
+            forceMicOpen()
         }
     }
 
@@ -83,6 +86,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         hangoverTask?.cancel()
         hangoverTask = nil
+        lastEnqueueAt = Date()
         scheduledBuffers += 1
         markSpeaking()
         bumpSpeakingWatchdog()
@@ -91,7 +95,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 guard let self else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
                 if self.scheduledBuffers == 0 {
-                    self.clearSpeakingAfterHangover(immediate: false)
+                    self.clearSpeakingAfterHangover()
                 }
             }
         }
@@ -107,43 +111,54 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         hangoverTask = nil
         player?.stop()
         stopPCM()
-        isSpeaking = false
-        suppressMic.set(false)
+        forceMicOpen()
     }
 
     private func markSpeaking() {
         isSpeaking = true
-        suppressMic.set(true)
+        // Headphones/BT: no speaker bleed — keep mic open so operator can barge in / reply.
+        if OutputRoute.shouldDuckMicForEcho() {
+            suppressMic.set(true)
+        } else {
+            suppressMic.set(false)
+        }
     }
 
-    /// Drop isSpeaking for UI, but keep mic muted briefly so echo doesn't trip server VAD.
-    private func clearSpeakingAfterHangover(immediate: Bool) {
+    private func clearSpeakingAfterHangover() {
         isSpeaking = false
-        suppressMic.set(true)
-        hangoverTask?.cancel()
-        if immediate {
+        guard OutputRoute.shouldDuckMicForEcho() else {
             suppressMic.set(false)
             return
         }
+        suppressMic.set(true)
+        hangoverTask?.cancel()
         hangoverTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 450_000_000)
+            try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
-            if self.scheduledBuffers == 0, self.player?.isPlaying != true {
+            if self.scheduledBuffers == 0 {
                 self.suppressMic.set(false)
             }
         }
     }
 
-    /// Only recovers stuck UI state — never cancels in-flight PCM buffers.
+    /// Buffer completions are unreliable on AVAudioPlayerNode — never stay deaf.
     private func bumpSpeakingWatchdog() {
         speakingWatchdog?.cancel()
         speakingWatchdog = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard !Task.isCancelled else { return }
-            if self.scheduledBuffers == 0, self.player?.isPlaying != true {
-                self.clearSpeakingAfterHangover(immediate: false)
+            let idle = Date().timeIntervalSince(self.lastEnqueueAt)
+            // No new PCM for 1s ⇒ utterance over (or completions dropped). Re-open mic.
+            if idle >= 0.95 {
+                self.scheduledBuffers = 0
+                self.forceMicOpen()
             }
         }
+    }
+
+    private func forceMicOpen() {
+        isSpeaking = false
+        suppressMic.set(false)
     }
 
     private func ensurePCMEngine(sampleRate: Double) {
@@ -183,7 +198,85 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
-            self.clearSpeakingAfterHangover(immediate: false)
+            self.clearSpeakingAfterHangover()
         }
+    }
+}
+
+/// Built-in *speakers* need mic ducking; headphones / BT / USB headsets do not.
+enum OutputRoute {
+    static func shouldDuckMicForEcho() -> Bool {
+        guard let deviceID = defaultOutputDeviceID() else {
+            // Unknown → prefer hearing the operator over echo protection.
+            return false
+        }
+        let transport = transportType(of: deviceID)
+        // AirPods / BT / USB interfaces never need speaker-echo ducking.
+        if transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+            || transport == kAudioDeviceTransportTypeUSB
+        {
+            return false
+        }
+        // MacBook built-in: same device for speakers and wired headphones — check data source.
+        if let source = outputDataSource(of: deviceID) {
+            // 'ispk' = internal speakers; 'hdpn' = headphones jack.
+            if source == fourCC("hdpn") { return false }
+            if source == fourCC("ispk") { return true }
+        }
+        // Built-in with unknown source → duck (classic laptop speakers).
+        return transport == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    private static func defaultOutputDeviceID() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        return deviceID
+    }
+
+    private static func transportType(of deviceID: AudioDeviceID) -> UInt32? {
+        var transport = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport)
+        return status == noErr ? transport : nil
+    }
+
+    private static func outputDataSource(of deviceID: AudioDeviceID) -> UInt32? {
+        var source = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDataSource,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &source)
+        return status == noErr ? source : nil
+    }
+
+    private static func fourCC(_ s: String) -> UInt32 {
+        var value: UInt32 = 0
+        for byte in s.utf8.prefix(4) {
+            value = (value << 8) | UInt32(byte)
+        }
+        return value
     }
 }
