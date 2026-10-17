@@ -173,8 +173,13 @@ struct ContentView: View {
                 return
             }
             if type == "realtime_interrupt" {
-                speech.stop()
-                if let reason = payload["reason"] as? String, reason != "speech" {
+                let reason = payload["reason"] as? String
+                // Mouse pause only freezes desktop tools — don't chop mid-sentence audio.
+                // Speech barge-in (real operator talk) still stops local playback.
+                if reason != "mouse" {
+                    speech.stop()
+                }
+                if let reason, reason != "speech" {
                     append("Interrupted (\(reason)).")
                 }
                 return
@@ -206,14 +211,13 @@ struct ContentView: View {
             }
         }
 
+        // Off-MainActor path: drop chunks while local audio plays (echo → VAD barge-in → cutoff),
+        // and write stdin without Task-per-chunk (that flooded MainActor and crashed the HUD).
+        let ingress = worker.audioIngress
+        let player = speech
         voice.onPCMChunk = { @Sendable data in
-            Task { @MainActor in
-                guard realtimeLive, worker.ready, !speech.isSpeaking else { return }
-                try? worker.sendUnordered(
-                    type: "realtime_audio_in",
-                    extra: ["audio_base64": data.base64EncodedString()]
-                )
-            }
+            if player.shouldSuppressMic() { return }
+            ingress.sendPCMBase64(data.base64EncodedString())
         }
     }
 
@@ -236,10 +240,12 @@ struct ContentView: View {
             cursor.show()
             _ = try await worker.send(type: "realtime_start", extra: ["policy": policy])
             realtimeLive = true
+            worker.setRealtimeAudioEnabled(true)
             try await voice.startStreaming()
             append("Session open — realtime mic live. Just talk.")
         } catch {
             realtimeLive = false
+            worker.setRealtimeAudioEnabled(false)
             voice.stopStreaming()
             session = .idle
             append("Start failed: \(error.localizedDescription)")
@@ -300,6 +306,7 @@ struct ContentView: View {
         voice.stopStreaming()
         speech.stop()
         realtimeLive = false
+        worker.setRealtimeAudioEnabled(false)
         do {
             if worker.ready {
                 _ = try? await worker.send(type: "realtime_stop")

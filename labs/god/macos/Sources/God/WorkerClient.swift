@@ -14,11 +14,51 @@ enum WorkerClientError: LocalizedError {
     }
 }
 
+/// Serialized stdin writes for realtime PCM — callable off MainActor to avoid Task-per-chunk crashes.
+final class AudioIngress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: FileHandle?
+    private var enabled = false
+
+    func configure(handle: FileHandle?, enabled: Bool) {
+        lock.lock()
+        self.handle = handle
+        self.enabled = enabled
+        lock.unlock()
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        self.enabled = enabled
+        lock.unlock()
+    }
+
+    func sendPCMBase64(_ audioBase64: String) {
+        lock.lock()
+        let handle = self.handle
+        let enabled = self.enabled
+        lock.unlock()
+        guard enabled, let handle else { return }
+        let payload: [String: Any] = [
+            "type": "realtime_audio_in",
+            "id": UUID().uuidString,
+            "audio_base64": audioBase64,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        var line = data
+        line.append(0x0A)
+        try? handle.write(contentsOf: line)
+    }
+}
+
 @MainActor
 final class WorkerClient: ObservableObject {
     @Published private(set) var statusText = "Disconnected"
     @Published private(set) var ready = false
     var onEvent: (([String: Any]) -> Void)?
+
+    /// Shared with VoiceCapture; writes PCM without hopping to MainActor.
+    let audioIngress = AudioIngress()
 
     private var process: Process?
     private var stdinPipe: Pipe?
@@ -100,10 +140,12 @@ final class WorkerClient: ObservableObject {
                 self.stdoutPipe = stdout
                 self.stderrPipe = stderr
                 self.ready = false
+                self.audioIngress.configure(handle: stdin.fileHandleForWriting, enabled: false)
                 self.statusText = "Waiting for worker ready…"
             } catch {
                 self.timeoutTask?.cancel()
                 self.readyContinuation = nil
+                self.audioIngress.configure(handle: nil, enabled: false)
                 continuation.resume(throwing: WorkerClientError.spawnFailed(error.localizedDescription))
             }
         }
@@ -111,9 +153,14 @@ final class WorkerClient: ObservableObject {
         timeoutTask = nil
     }
 
+    func setRealtimeAudioEnabled(_ enabled: Bool) {
+        audioIngress.setEnabled(enabled && ready)
+    }
+
     func stopWorker() {
         timeoutTask?.cancel()
         timeoutTask = nil
+        audioIngress.configure(handle: nil, enabled: false)
         detachReaders()
 
         let running = process
@@ -239,6 +286,7 @@ final class WorkerClient: ObservableObject {
         detachReaders()
         timeoutTask?.cancel()
         timeoutTask = nil
+        audioIngress.configure(handle: nil, enabled: false)
         ready = false
         process = nil
         stdinPipe = nil

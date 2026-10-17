@@ -1,15 +1,46 @@
 import AVFoundation
 import Foundation
 
+/// Thread-safe bool readable from the audio capture path (off MainActor).
+private final class AtomicBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+
+    init(_ value: Bool = false) {
+        self.value = value
+    }
+
+    func set(_ newValue: Bool) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @MainActor
 final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isSpeaking = false
+
+    /// Mic must stay muted while we play (+ hangover) or speaker echo barges in and cuts God off.
+    private let suppressMic = AtomicBool(false)
+    private var hangoverTask: Task<Void, Never>?
+    private var speakingWatchdog: Task<Void, Never>?
 
     private var player: AVAudioPlayer?
     private var engine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var pcmFormat: AVAudioFormat?
     private var scheduledBuffers = 0
+
+    nonisolated func shouldSuppressMic() -> Bool {
+        suppressMic.get()
+    }
 
     // MARK: - File / compressed (mp3 TTS)
 
@@ -25,10 +56,10 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let player = try AVAudioPlayer(data: data)
             player.delegate = self
             self.player = player
-            isSpeaking = true
+            markSpeaking()
             player.play()
         } catch {
-            isSpeaking = false
+            clearSpeakingAfterHangover(immediate: true)
         }
     }
 
@@ -50,14 +81,17 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             dst.update(from: src, count: frameCount)
         }
 
+        hangoverTask?.cancel()
+        hangoverTask = nil
         scheduledBuffers += 1
-        isSpeaking = true
+        markSpeaking()
+        bumpSpeakingWatchdog()
         playerNode.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
                 if self.scheduledBuffers == 0 {
-                    self.isSpeaking = false
+                    self.clearSpeakingAfterHangover(immediate: false)
                 }
             }
         }
@@ -67,9 +101,49 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func stop() {
+        speakingWatchdog?.cancel()
+        speakingWatchdog = nil
+        hangoverTask?.cancel()
+        hangoverTask = nil
         player?.stop()
         stopPCM()
         isSpeaking = false
+        suppressMic.set(false)
+    }
+
+    private func markSpeaking() {
+        isSpeaking = true
+        suppressMic.set(true)
+    }
+
+    /// Drop isSpeaking for UI, but keep mic muted briefly so echo doesn't trip server VAD.
+    private func clearSpeakingAfterHangover(immediate: Bool) {
+        isSpeaking = false
+        suppressMic.set(true)
+        hangoverTask?.cancel()
+        if immediate {
+            suppressMic.set(false)
+            return
+        }
+        hangoverTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard !Task.isCancelled else { return }
+            if self.scheduledBuffers == 0, self.player?.isPlaying != true {
+                self.suppressMic.set(false)
+            }
+        }
+    }
+
+    /// Only recovers stuck UI state — never cancels in-flight PCM buffers.
+    private func bumpSpeakingWatchdog() {
+        speakingWatchdog?.cancel()
+        speakingWatchdog = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            if self.scheduledBuffers == 0, self.player?.isPlaying != true {
+                self.clearSpeakingAfterHangover(immediate: false)
+            }
+        }
     }
 
     private func ensurePCMEngine(sampleRate: Double) {
@@ -109,7 +183,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
-            self.isSpeaking = false
+            self.clearSpeakingAfterHangover(immediate: false)
         }
     }
 }

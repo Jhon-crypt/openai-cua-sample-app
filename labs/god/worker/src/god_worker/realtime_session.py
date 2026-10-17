@@ -20,9 +20,9 @@ from god_worker.stuck import StuckDetector
 Emit = Callable[[dict[str, Any]], None]
 
 DEFAULT_MODEL = "gpt-realtime-2.1"
-MOUSE_MOVE_THRESHOLD_PX = 14
-MOUSE_INTERRUPT_COOLDOWN_S = 5.0
-MOUSE_POLL_S = 0.08
+MOUSE_MOVE_THRESHOLD_PX = 36
+MOUSE_INTERRUPT_COOLDOWN_S = 10.0
+MOUSE_POLL_S = 0.15
 
 
 def build_instructions(policy: str, plan: str = "") -> str:
@@ -41,9 +41,10 @@ def build_instructions(policy: str, plan: str = "") -> str:
             "Never use Spotlight. Always open_app('ExactAppName') (e.g. Google Chrome).",
             "Workflow: update_plan → open_app → click_text/click_element (or screenshot+click) → trust auto-verify.",
             "Mouse moves are slow so the operator can watch the red cursor ring.",
-            "If told the operator moved the mouse, pause desktop work and say:",
-            "'Seems you moved your mouse — tell me when to continue with what you're doing.'",
-            "Wait for continue (or a new instruction) before acting again.",
+            "Always answer the operator when they speak — conversation must never go silent.",
+            "If told the operator moved the mouse, pause only DESKTOP tools (clicks/typing), still chat normally,",
+            "and say briefly that you paused actions until they say continue or give a new task.",
+            "Any new spoken instruction (not only the word continue) may resume desktop work.",
             "If stuck-detection says to change approach, do not repeat the same failing click.",
             f"Current plan:\n{plan_block}",
             f"Operator policy:\n{policy.strip() or '(none — follow the user safely)'}",
@@ -339,12 +340,41 @@ class RealtimeSession:
                 text = transcript.strip()
                 self.emit({"type": "agent_event", "level": "info", "message": f"You: {text}"})
                 lower = text.lower()
-                if self._awaiting_continue and any(
-                    w in lower for w in ("continue", "go ahead", "keep going", "resume", "carry on")
-                ):
-                    self._awaiting_continue = False
-                    self._paused = False
-                    self._actions_frozen = False
+                # Any real utterance resumes chat+tools so the operator is never stuck muted
+                # after an accidental mouse bump. Short acks still count.
+                if self._awaiting_continue or self._paused:
+                    resume_words = (
+                        "continue",
+                        "go ahead",
+                        "keep going",
+                        "resume",
+                        "carry on",
+                        "open",
+                        "click",
+                        "type",
+                        "please",
+                        "can you",
+                        "could you",
+                        "do ",
+                        "start",
+                        "stop",
+                        "yes",
+                        "ok",
+                        "okay",
+                    )
+                    if len(text) >= 2 and (
+                        any(w in lower for w in resume_words) or len(text.split()) >= 2
+                    ):
+                        self._awaiting_continue = False
+                        self._paused = False
+                        self._actions_frozen = False
+                        self.emit(
+                            {
+                                "type": "agent_event",
+                                "level": "info",
+                                "message": "Resumed after operator speech.",
+                            }
+                        )
             return
 
         if etype == "response.done":
@@ -527,13 +557,14 @@ class RealtimeSession:
                 "message": "Mouse moved by operator — pausing actions.",
             }
         )
-        self.emit({"type": "realtime_interrupt", "reason": "mouse"})
+        # Do not emit realtime_interrupt here — that chopped live speech mid-sentence.
+        # Tools stay frozen via _paused / _awaiting_continue; chat audio keeps playing.
         try:
             self.send_text(
                 "SYSTEM NOTICE: The operator just moved the mouse themselves. "
-                "Stop any desktop actions. Say aloud: "
-                "'Seems you moved your mouse — tell me when to continue with what you're doing.' "
-                "Do not call tools until they say continue or give a new instruction.",
+                "Pause only desktop tools (clicks/typing). Keep talking normally. "
+                "Briefly acknowledge you paused actions until they say continue or give a new task. "
+                "Do not call desktop tools until they resume.",
                 create_response=True,
             )
         except Exception as error:  # noqa: BLE001
