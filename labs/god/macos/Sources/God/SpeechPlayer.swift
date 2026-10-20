@@ -33,7 +33,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// True while local God audio is playing (even on headphones where mic is not ducked).
     private let playbackActive = AtomicBool(false)
     private var speakingWatchdog: Task<Void, Never>?
-    /// Wall-clock time the last scheduled PCM buffer finishes playing. Live streams audio
+    /// Wall-clock time the last scheduled PCM buffer finishes playing; audio can arrive
     /// faster than realtime, so arrival time says nothing about when playback ends.
     private var playbackEndsAt = Date.distantPast
 
@@ -89,24 +89,33 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
               let buffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(frameCount))
         else { return }
         buffer.frameLength = AVAudioFrameCount(frameCount)
+        var sumSquares: Float = 0
         data.withUnsafeBytes { raw in
             guard let src = raw.bindMemory(to: Int16.self).baseAddress,
                   let dst = buffer.floatChannelData?[0] else { return }
             for i in 0..<frameCount {
-                dst[i] = Float(Int16(littleEndian: src[i])) / 32_768
+                let sample = Float(Int16(littleEndian: src[i])) / 32_768
+                dst[i] = sample
+                sumSquares += sample * sample
             }
         }
 
         let now = Date()
-        if !isSpeaking { markSpeaking() }
         let startsAt = max(now, playbackEndsAt)
         playbackEndsAt = startsAt.addingTimeInterval(Double(frameCount) / sampleRate)
         playerNode.scheduleBuffer(buffer, completionHandler: nil)
         if !playerNode.isPlaying {
             playerNode.play()
         }
+        // GPT-Live streams output audio nonstop, mostly digital silence. Only audible chunks
+        // count as God speaking; otherwise the mic stays ducked forever and Live hears nothing.
+        let rms = (sumSquares / Float(frameCount)).squareRoot()
+        guard rms >= Self.audibleRMS else { return }
+        if !isSpeaking { markSpeaking() }
         scheduleEndOfSpeech(after: playbackEndsAt.timeIntervalSince(now))
     }
+
+    private static let audibleRMS: Float = 0.01
 
     /// Drop queued audio but keep the engine alive — tearing it down on every barge-in
     /// reconfigures CoreAudio and makes the next reply start late or not at all.

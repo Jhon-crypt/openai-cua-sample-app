@@ -136,10 +136,10 @@ struct ContentView: View {
     }
 
     private var micStatusLabel: String {
-        if audioProfile.isEmpty {
-            return "Realtime mic live — speak naturally."
+        if audioProfile == "far_field" {
+            return "Mic live — muted while God talks (laptop speakers)."
         }
-        return "Realtime mic live (\(audioProfile)) — speak naturally."
+        return "Mic live — speak naturally."
     }
 
     private var usageBar: some View {
@@ -258,7 +258,7 @@ struct ContentView: View {
     private func startSession() async {
         busy = true
         defer { busy = false }
-        append("Starting realtime session…")
+        append("Starting voice session…")
         do {
             try await worker.start()
             session = .listening
@@ -272,8 +272,7 @@ struct ContentView: View {
             realtimeLive = true
             worker.setRealtimeAudioEnabled(true)
             try await voice.startStreaming()
-            let mode = nr == "far_field" ? "laptop mic + server_vad" : "headset + semantic_vad"
-            append("Session open — \(mode). Just talk.")
+            append(nr == "far_field" ? "Mic on — laptop speakers." : "Mic on — headphones.")
         } catch {
             realtimeLive = false
             worker.setRealtimeAudioEnabled(false)
@@ -381,7 +380,7 @@ private enum SessionPhase {
     var label: String {
         switch self {
         case .idle: return "Idle"
-        case .listening: return "Realtime open"
+        case .listening: return "Session open"
         case .acting: return "Acting"
         case .stopped: return "Stopped"
         }
