@@ -139,19 +139,22 @@ def run_agent_loop(
     from openai import OpenAI
 
     from god_worker.speech import speak
+    from god_worker.stuck import StuckDetector
 
     client = OpenAI(api_key=api_key)
     chosen_model = model or os.environ.get("CUA_DEFAULT_MODEL") or "gpt-6-astra"
     instructions = "\n".join(
         [
-            "You are God, a personal macOS desktop operator.",
+            "You are God, a personal macOS desktop operator (background desktop runner).",
             "You can operate any macOS app (Safari, Slack, Notes, Finder, Terminal, etc.).",
             "Use exec_py with PyAutoGUI to inspect and control the screen.",
             "To open apps, always use open_app('AppName') (e.g. open_app('Safari')). Never rely on Spotlight.",
             "After open_app, sleep briefly, screenshot, then type or click only if the target UI is visible.",
             "Prefer moveTo before click. Mouse moves are slow so the operator can see them.",
             "Obey the operator policy exactly when present.",
-            "Prefer short action sequences, then screenshot to verify.",
+            "CRITICAL: Keep each exec_py SHORT — one primary action (or open+brief wait), then screenshot to verify.",
+            "Do not pack long browse chains into a single exec_py. Yield between steps so the operator can interrupt.",
+            "If the same action fails twice, change approach; do not repeat identical failing code.",
             "When finished, reply with a brief spoken-friendly final answer (no tool call).",
             f"Operator policy:\n{policy.strip() or '(none — follow the goal safely)'}",
         ]
@@ -164,6 +167,7 @@ def run_agent_loop(
     namespace: dict[str, Any] = {"pyautogui": pyautogui, "time": time_mod, "open_app": open_app}
     previous_response_id: str | None = None
     next_input: Any = goal.strip()
+    stuck = StuckDetector()
     emit({"type": "agent_event", "level": "info", "message": f"Agent started ({chosen_model})."})
     if talk:
         speak(client, f"On it. {goal[:120]}", emit)
@@ -209,18 +213,39 @@ def run_agent_loop(
         for call in classified["calls"]:
             if cancel.is_set():
                 raise RuntimeError("Agent stopped by operator.")
+            code = call["code"]
+            args_key = code.strip()[:240]
             emit(
                 {
                     "type": "agent_event",
                     "level": "pending",
-                    "message": f"exec_py: {call['code'][:180]}{'…' if len(call['code']) > 180 else ''}",
+                    "message": f"exec_py: {code[:180]}{'…' if len(code) > 180 else ''}",
                 }
             )
             try:
-                output = execute_code(call["code"], namespace)
+                output = execute_code(code, namespace)
+                ok = True
             except Exception as error:  # noqa: BLE001 - return to model
                 output = [{"type": "input_text", "text": f"exec_py error: {error}"}]
                 emit({"type": "agent_event", "level": "error", "message": str(error)})
+                ok = False
+            streak = stuck.observe("exec_py", args_key, ok=ok)
+            if streak.get("stuck"):
+                output = list(output) + [
+                    {
+                        "type": "input_text",
+                        "text": f"stuck: {streak.get('message')} — change approach or finish with an explanation.",
+                    }
+                ]
+                emit(
+                    {
+                        "type": "agent_event",
+                        "level": "error" if streak.get("action") == "stop" else "info",
+                        "message": streak.get("message", "stuck"),
+                    }
+                )
+                if streak.get("action") == "stop":
+                    raise RuntimeError(streak.get("message") or "Stuck — stopping desktop actions.")
             tool_outputs.append(
                 {"type": "function_call_output", "call_id": call["call_id"], "output": output}
             )

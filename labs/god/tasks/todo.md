@@ -11,4 +11,9 @@
   - Files: `labs/god/macos/**`
 - [x] Task: agent-loop (Responses + exec_py in worker; HUD Run Goal)
 - [x] Task: voice-session (Mic → Whisper → goal field)
+- [x] Task: voice-tools-split (Realtime voice + background DesktopTaskRunner)
+- [x] Task: live (GPT-Live client delegation → DesktopTaskRunner; Realtime fallback)
+- [ ] Task: live manual checks (TV noise silent, "open Chrome", "stop", correction, talk mid-task)
+- [ ] Task: push-to-talk via `session.input_audio.mute` + idle auto-close (ask first)
+- [ ] Task: speaker barge-in via Apple voice-processing echo cancellation
 - [ ] Task: session-log (later)

@@ -219,6 +219,11 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
 /// Built-in *speakers* need mic ducking; headphones / BT / USB headsets do not.
 enum OutputRoute {
+    /// OpenAI Realtime: near_field for close mics (AirPods), far_field for laptop/room mics.
+    static func realtimeNoiseReduction() -> String {
+        shouldDuckMicForEcho() ? "far_field" : "near_field"
+    }
+
     static func shouldDuckMicForEcho() -> Bool {
         guard let deviceID = defaultOutputDeviceID() else {
             // Unknown → prefer hearing the operator over echo protection.

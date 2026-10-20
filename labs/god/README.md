@@ -4,7 +4,7 @@ Personal **voice Mac operator** workspace. Not a browser lab template — do **n
 
 ## Run
 
-Requires root `.env` with `OPENAI_API_KEY`. Primary harness = **OpenAI Realtime API** with structured GUI tools (`open_app`, `screenshot`, `click`, `type_text`, `hotkey`, `update_plan`) plus `exec_py` escape hatch, plan/context compaction, and stuck detection. Optional fallback: Responses loop.
+Requires root `.env` with `OPENAI_API_KEY`. Voice = **GPT-Live** (`gpt-live-1`, client delegation): it only answers when addressed and hands every Mac action to a **background desktop runner** (Responses + `exec_py`, short batches, stuck detection). Set `GOD_VOICE_BACKEND=realtime` to fall back to the Realtime API. See [SPEC-live.md](SPEC-live.md).
 
 ```bash
 uv sync --project labs/god/worker --extra dev   # pulls openai[realtime] (websockets)
@@ -14,12 +14,12 @@ uv run --project labs/god/worker pytest
 cd labs/god/macos && swift run God
 ```
 
-In the HUD: **Start Session** opens a Realtime conversation (mic streams automatically). Just talk — God replies by voice and can drive **any Mac app** mid-conversation (visible red cursor ring). Prefer asking it to click labels (`click_text`); raw `click` coords are mapped from the screenshot. Type optional text via **Send Text**.
+In the HUD: **Start Session** opens a Live conversation (mic streams automatically). Talk to God when you want something; it stays silent for room noise and chatter. Mac goals run in the background (red cursor ring) while you keep talking; say “stop” to cancel, or correct it mid-task. **Send Text** sends a goal straight to the desktop runner.
 
-If you move the mouse yourself, God pauses and says to tell it when to continue. Repeated identical failures freeze actions after a stuck warning.
+If you move the mouse yourself **while a desktop task is running**, God stops that task and tells you.
 
-Token / $ meter uses `GOD_INPUT_USD_PER_MTK` / `GOD_OUTPUT_USD_PER_MTK`. Model/voice: `GOD_REALTIME_MODEL` (default **`gpt-realtime-2.1`** — current Realtime API model; not the old `gpt-4o-realtime-*` previews). Voice: `GOD_REALTIME_VOICE` (default `marin`). The newer **`gpt-live-1`** model uses the separate Live API (`/v1/live`), not Realtime.
+Cost meter: Live voice at `GOD_LIVE_USD_PER_MIN` (default $0.05/min, billed while the session is open — press Stop when idle) plus desktop-agent tokens at `GOD_INPUT_USD_PER_MTK` / `GOD_OUTPUT_USD_PER_MTK`. Live model/voice: `GOD_LIVE_MODEL` (default `gpt-live-1`), `GOD_LIVE_VOICE` (default `marin`). Realtime fallback: `GOD_REALTIME_MODEL` (default `gpt-realtime-2.1`), `GOD_REALTIME_VOICE`.
 
 **Stop** / ⌘⇧. tears down Realtime and releases input. Grant Accessibility, Screen Recording, and Microphone.
 
-Docs: [SPEC.md](SPEC.md) · [SPEC-realtime.md](SPEC-realtime.md) · [CAPABILITY-MAP.md](CAPABILITY-MAP.md)
+Docs: [SPEC.md](SPEC.md) · [SPEC-live.md](SPEC-live.md) · [SPEC-realtime.md](SPEC-realtime.md) · [CAPABILITY-MAP.md](CAPABILITY-MAP.md)

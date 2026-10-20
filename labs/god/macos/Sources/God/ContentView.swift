@@ -25,8 +25,7 @@ struct ContentView: View {
     @State private var outputTokens = 0
     @State private var costUSD = 0.0
     @State private var whisperSeconds = 0.0
-    /// Shared with the mic callback — drops noise-floor audio before Realtime VAD sees it.
-    private let micGate = MicEnergyGate()
+    @State private var audioProfile = ""
 
     init() {
         _worker = StateObject(wrappedValue: WorkerClient())
@@ -55,7 +54,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
 
             if voice.isStreaming {
-                Text("Realtime mic live — speak naturally.")
+                Text(micStatusLabel)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.green)
             }
@@ -93,7 +92,7 @@ struct ContentView: View {
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Any Mac app via open_app + clicks/typing. Red ring follows the agent mouse. Move mouse to pause; say “continue”. ⌘⇧. stops.")
+            Text("Ask God to do something on the Mac; it stays quiet otherwise. Say “stop” to cancel. Moving the mouse stops the current task. ⌘⇧. ends the session.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -124,6 +123,23 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .godStop)) { _ in
             Task { await stopSession() }
         }
+        // Do NOT use Timer.publish(...).autoconnect() inside body — Swift 6 recreates it
+        // every render and traps in isMainExecutor (bus error). Structured task is safe.
+        .task(id: realtimeLive) {
+            guard realtimeLive else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, realtimeLive else { break }
+                await syncAudioProfileIfNeeded()
+            }
+        }
+    }
+
+    private var micStatusLabel: String {
+        if audioProfile.isEmpty {
+            return "Realtime mic live — speak naturally."
+        }
+        return "Realtime mic live (\(audioProfile)) — speak naturally."
     }
 
     private var usageBar: some View {
@@ -140,7 +156,7 @@ struct ContentView: View {
             }
             ProgressView(value: Double(min(inputTokens + outputTokens, 200_000)), total: 200_000)
                 .tint(.orange)
-            Text("Projected ≈ \(costLabel) @ GOD_*_USD_PER_MTK. Realtime audio billed as tokens.")
+            Text("Projected ≈ \(costLabel). Live voice billed per minute; desktop agent per token.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -184,12 +200,8 @@ struct ContentView: View {
             if type == "realtime_interrupt" {
                 let reason = payload["reason"] as? String
                 // Mouse pause only freezes desktop tools — don't chop mid-sentence audio.
-                // Speech barge-in only if the energy gate recently saw real voice (not Mac noise).
-                if reason == "speech" {
-                    if micGate.wasOpenRecently() {
-                        speech.stop()
-                    }
-                } else if reason != "mouse" {
+                // Speech barge-in: trust Realtime VAD + noise_reduction.
+                if reason != "mouse" {
                     speech.stop()
                 }
                 if let reason, reason != "speech" {
@@ -224,13 +236,11 @@ struct ContentView: View {
             }
         }
 
-        // Off-MainActor path: duck on speakers, RMS-gate noise, write stdin without Task-per-chunk.
+        // Stream full PCM to Realtime (NR + semantic VAD). Only duck on laptop speakers (echo).
         let ingress = worker.audioIngress
         let player = speech
-        let gate = micGate
         voice.onPCMChunk = { @Sendable data in
             if player.shouldSuppressMic() { return }
-            guard gate.allow(data, godSpeaking: player.isPlaybackActive()) else { return }
             ingress.sendPCMBase64(data.base64EncodedString())
         }
     }
@@ -252,18 +262,41 @@ struct ContentView: View {
             try await worker.start()
             session = .listening
             cursor.show()
-            _ = try await worker.send(type: "realtime_start", extra: ["policy": policy])
+            let nr = OutputRoute.realtimeNoiseReduction()
+            _ = try await worker.send(
+                type: "realtime_start",
+                extra: ["policy": policy, "noise_reduction": nr]
+            )
+            audioProfile = nr
             realtimeLive = true
             worker.setRealtimeAudioEnabled(true)
-            micGate.reset()
             try await voice.startStreaming()
-            append("Session open — realtime mic live. Just talk.")
+            let mode = nr == "far_field" ? "laptop mic + server_vad" : "headset + semantic_vad"
+            append("Session open — \(mode). Just talk.")
         } catch {
             realtimeLive = false
             worker.setRealtimeAudioEnabled(false)
             voice.stopStreaming()
+            audioProfile = ""
             session = .idle
             append("Start failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Hot-swap NR/VAD when AirPods connect/disconnect mid-session.
+    private func syncAudioProfileIfNeeded() async {
+        guard realtimeLive, worker.ready else { return }
+        let nr = OutputRoute.realtimeNoiseReduction()
+        guard nr != audioProfile else { return }
+        do {
+            _ = try await worker.send(
+                type: "realtime_audio_profile",
+                extra: ["noise_reduction": nr]
+            )
+            audioProfile = nr
+            append("Audio profile → \(nr).")
+        } catch {
+            append("Audio profile update failed: \(error.localizedDescription)")
         }
     }
 
@@ -320,8 +353,8 @@ struct ContentView: View {
         defer { busy = false }
         voice.stopStreaming()
         speech.stop()
-        micGate.reset()
         realtimeLive = false
+        audioProfile = ""
         worker.setRealtimeAudioEnabled(false)
         do {
             if worker.ready {

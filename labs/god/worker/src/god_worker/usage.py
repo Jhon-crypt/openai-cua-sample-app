@@ -23,9 +23,11 @@ class UsageMeter:
     input_tokens: int = 0
     output_tokens: int = 0
     whisper_seconds: float = 0.0
+    live_seconds: float = 0.0
     input_usd_per_mtok: float = field(default_factory=lambda: _rate("GOD_INPUT_USD_PER_MTK", 2.50))
     output_usd_per_mtok: float = field(default_factory=lambda: _rate("GOD_OUTPUT_USD_PER_MTK", 10.0))
     whisper_usd_per_min: float = field(default_factory=lambda: _rate("GOD_WHISPER_USD_PER_MIN", 0.006))
+    live_usd_per_min: float = field(default_factory=lambda: _rate("GOD_LIVE_USD_PER_MIN", 0.05))
 
     def add_response_usage(self, usage: dict | None) -> dict:
         usage = usage or {}
@@ -41,6 +43,11 @@ class UsageMeter:
         self.whisper_seconds += seconds
         return self.snapshot(whisper_seconds=seconds)
 
+    def set_live_seconds(self, session_total: float, *, base: float = 0.0) -> dict:
+        """GPT-Live reports cumulative seconds per session; `base` carries earlier sessions."""
+        self.live_seconds = max(self.live_seconds, base + max(0.0, float(session_total)))
+        return self.snapshot()
+
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
@@ -51,6 +58,7 @@ class UsageMeter:
             (self.input_tokens / 1_000_000) * self.input_usd_per_mtok
             + (self.output_tokens / 1_000_000) * self.output_usd_per_mtok
             + (self.whisper_seconds / 60.0) * self.whisper_usd_per_min
+            + (self.live_seconds / 60.0) * self.live_usd_per_min
         )
 
     def snapshot(self, **extra) -> dict:
@@ -61,10 +69,12 @@ class UsageMeter:
             "total_tokens": self.total_tokens,
             "cost_usd": round(self.cost_usd, 6),
             "whisper_seconds": round(self.whisper_seconds, 2),
+            "live_seconds": round(self.live_seconds, 1),
             "rates": {
                 "input_usd_per_mtok": self.input_usd_per_mtok,
                 "output_usd_per_mtok": self.output_usd_per_mtok,
                 "whisper_usd_per_min": self.whisper_usd_per_min,
+                "live_usd_per_min": self.live_usd_per_min,
             },
         }
         payload.update(extra)
