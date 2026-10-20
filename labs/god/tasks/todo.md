@@ -13,6 +13,8 @@
 - [x] Task: voice-session (Mic → Whisper → goal field)
 - [x] Task: voice-tools-split (Realtime voice + background DesktopTaskRunner)
 - [x] Task: live (GPT-Live client delegation → DesktopTaskRunner; Realtime fallback)
+- [x] Task: Live playback fixes (mic ducked until queued audio ends, silence instead of dropped chunks, Float32 player, no engine teardown on barge-in)
+- [ ] Task: build HUD with Swift ≥ 6.3.3 (Xcode 26.6 or swift.org toolchain) — 6.3.2 / Xcode 26.5 crashes in SwiftUI main-actor checks (swiftlang/swift#89197)
 - [ ] Task: live manual checks (TV noise silent, "open Chrome", "stop", correction, talk mid-task)
 - [ ] Task: push-to-talk via `session.input_audio.mute` + idle auto-close (ask first)
 - [ ] Task: speaker barge-in via Apple voice-processing echo cancellation

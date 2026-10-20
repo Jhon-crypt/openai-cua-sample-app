@@ -32,15 +32,15 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private let suppressMic = AtomicBool(false)
     /// True while local God audio is playing (even on headphones where mic is not ducked).
     private let playbackActive = AtomicBool(false)
-    private var hangoverTask: Task<Void, Never>?
     private var speakingWatchdog: Task<Void, Never>?
-    private var lastEnqueueAt = Date.distantPast
+    /// Wall-clock time the last scheduled PCM buffer finishes playing. Live streams audio
+    /// faster than realtime, so arrival time says nothing about when playback ends.
+    private var playbackEndsAt = Date.distantPast
 
     private var player: AVAudioPlayer?
     private var engine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var pcmFormat: AVAudioFormat?
-    private var scheduledBuffers = 0
 
     /// Required for `@StateObject` under Swift 6 / macOS 26 — MainActor-isolated init crashes body eval.
     nonisolated override init() {
@@ -71,7 +71,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             self.player = player
             markSpeaking()
             player.play()
-            bumpSpeakingWatchdog()
+            scheduleEndOfSpeech(after: player.duration)
         } catch {
             forceMicOpen()
         }
@@ -91,37 +91,31 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         buffer.frameLength = AVAudioFrameCount(frameCount)
         data.withUnsafeBytes { raw in
             guard let src = raw.bindMemory(to: Int16.self).baseAddress,
-                  let dst = buffer.int16ChannelData?[0] else { return }
-            dst.update(from: src, count: frameCount)
-        }
-
-        hangoverTask?.cancel()
-        hangoverTask = nil
-        lastEnqueueAt = Date()
-        scheduledBuffers += 1
-        markSpeaking()
-        bumpSpeakingWatchdog()
-        playerNode.scheduleBuffer(buffer) { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
-                if self.scheduledBuffers == 0 {
-                    self.clearSpeakingAfterHangover()
-                }
+                  let dst = buffer.floatChannelData?[0] else { return }
+            for i in 0..<frameCount {
+                dst[i] = Float(Int16(littleEndian: src[i])) / 32_768
             }
         }
+
+        let now = Date()
+        if !isSpeaking { markSpeaking() }
+        let startsAt = max(now, playbackEndsAt)
+        playbackEndsAt = startsAt.addingTimeInterval(Double(frameCount) / sampleRate)
+        playerNode.scheduleBuffer(buffer, completionHandler: nil)
         if !playerNode.isPlaying {
             playerNode.play()
         }
+        scheduleEndOfSpeech(after: playbackEndsAt.timeIntervalSince(now))
     }
 
+    /// Drop queued audio but keep the engine alive — tearing it down on every barge-in
+    /// reconfigures CoreAudio and makes the next reply start late or not at all.
     func stop() {
         speakingWatchdog?.cancel()
         speakingWatchdog = nil
-        hangoverTask?.cancel()
-        hangoverTask = nil
         player?.stop()
-        stopPCM()
+        playerNode?.stop()
+        playbackEndsAt = .distantPast
         forceMicOpen()
     }
 
@@ -129,43 +123,18 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isSpeaking = true
         playbackActive.set(true)
         // Headphones/BT: no speaker bleed — keep mic open so operator can barge in / reply.
-        if OutputRoute.shouldDuckMicForEcho() {
-            suppressMic.set(true)
-        } else {
-            suppressMic.set(false)
-        }
+        suppressMic.set(OutputRoute.shouldDuckMicForEcho())
     }
 
-    private func clearSpeakingAfterHangover() {
-        isSpeaking = false
-        playbackActive.set(false)
-        guard OutputRoute.shouldDuckMicForEcho() else {
-            suppressMic.set(false)
-            return
-        }
-        suppressMic.set(true)
-        hangoverTask?.cancel()
-        hangoverTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            if self.scheduledBuffers == 0 {
-                self.suppressMic.set(false)
-            }
-        }
-    }
-
-    /// Buffer completions are unreliable on AVAudioPlayerNode — never stay deaf.
-    private func bumpSpeakingWatchdog() {
+    /// Clears "speaking" once queued audio has actually played, plus a short echo tail
+    /// so the room reverb of God's last word is not sent back as operator speech.
+    private func scheduleEndOfSpeech(after seconds: TimeInterval) {
         speakingWatchdog?.cancel()
+        let delay = max(0, seconds) + 0.25
         speakingWatchdog = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            let idle = Date().timeIntervalSince(self.lastEnqueueAt)
-            // No new PCM for 1s ⇒ utterance over (or completions dropped). Re-open mic.
-            if idle >= 0.95 {
-                self.scheduledBuffers = 0
-                self.forceMicOpen()
-            }
+            self.forceMicOpen()
         }
     }
 
@@ -176,14 +145,14 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func ensurePCMEngine(sampleRate: Double) {
-        if engine != nil, pcmFormat?.sampleRate == sampleRate { return }
+        if let engine, pcmFormat?.sampleRate == sampleRate {
+            // Output route changes (AirPods on/off) stop the engine; restart instead of rebuilding.
+            if !engine.isRunning { try? engine.start() }
+            return
+        }
         stopPCM()
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: true
-        ) else { return }
+        // Standard (Float32, deinterleaved) is the format AVAudioPlayerNode is guaranteed to render.
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else { return }
 
         let engine = AVAudioEngine()
         let node = AVAudioPlayerNode()
@@ -207,12 +176,12 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         playerNode = nil
         engine = nil
         pcmFormat = nil
-        scheduledBuffers = 0
+        playbackEndsAt = .distantPast
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
-            self.clearSpeakingAfterHangover()
+            self.scheduleEndOfSpeech(after: 0)
         }
     }
 }

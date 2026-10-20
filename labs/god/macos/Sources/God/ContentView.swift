@@ -200,12 +200,11 @@ struct ContentView: View {
             if type == "realtime_interrupt" {
                 let reason = payload["reason"] as? String
                 // Mouse pause only freezes desktop tools — don't chop mid-sentence audio.
-                // Speech barge-in: trust Realtime VAD + noise_reduction.
                 if reason != "mouse" {
                     speech.stop()
                 }
-                if let reason, reason != "speech" {
-                    append("Interrupted (\(reason)).")
+                if let reason {
+                    append(reason == "speech" ? "Playback cut: God yielded to your voice." : "Interrupted (\(reason)).")
                 }
                 return
             }
@@ -240,8 +239,10 @@ struct ContentView: View {
         let ingress = worker.audioIngress
         let player = speech
         voice.onPCMChunk = { @Sendable data in
-            if player.shouldSuppressMic() { return }
-            ingress.sendPCMBase64(data.base64EncodedString())
+            // Live's transcript/delegation offsets are positions in the input stream: send
+            // silence (not nothing) while ducked so the timeline stays continuous.
+            let chunk = player.shouldSuppressMic() ? Data(count: data.count) : data
+            ingress.sendPCMBase64(chunk.base64EncodedString())
         }
     }
 
