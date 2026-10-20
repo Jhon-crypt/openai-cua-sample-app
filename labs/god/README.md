@@ -14,6 +14,13 @@ uv run --project labs/god/worker pytest
 cd labs/god/macos && swift run God
 ```
 
+Build the HUD with Swift ≥ 6.3.3. Swift 6.3.2 (Xcode 26.5) miscompiles main-actor checks and the HUD crashes mid-session ([swiftlang/swift#89197](https://github.com/swiftlang/swift/issues/89197)). With the swift.org toolchain installed in `~/Library/Developer/Toolchains`:
+
+```bash
+export TOOLCHAINS=$(plutil -extract CFBundleIdentifier raw ~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/Info.plist)
+swift --version   # Swift 6.3.3
+```
+
 In the HUD: **Start Session** opens a Live conversation (mic streams automatically). Talk to God when you want something; it stays silent for room noise and chatter. Mac goals run in the background (red cursor ring) while you keep talking; say “stop” to cancel, or correct it mid-task. **Send Text** sends a goal straight to the desktop runner.
 
 If you move the mouse yourself **while a desktop task is running**, God stops that task and tells you.
