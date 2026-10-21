@@ -1,5 +1,7 @@
 # Spec: shell-hud
 
+> **Status:** slice-1 spec, shipped. The HUD now also streams the mic and plays Live audio; see [AGENTS.md](AGENTS.md) for the current protocol and audio rules.
+
 ## Objective
 
 Native SwiftUI app that owns the session chrome: status, Start/Stop, Test Click, live log lines, kill-switch hotkey.

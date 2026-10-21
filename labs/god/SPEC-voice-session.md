@@ -1,5 +1,7 @@
 # Spec: voice-session
 
+> **Status:** superseded. Push-to-talk Whisper was replaced by Realtime, then by GPT-Live ([SPEC-live.md](SPEC-live.md)). The `transcribe` request still exists but the HUD no longer uses it.
+
 ## Objective
 
 While a God session is open, capture mic audio, transcribe via OpenAI Audio Transcriptions, and treat the text as a goal (and/or policy update).

@@ -27,6 +27,6 @@ If you move the mouse yourself **while a desktop task is running**, God stops th
 
 Cost meter: Live voice at `GOD_LIVE_USD_PER_MIN` (default $0.05/min, billed while the session is open — press Stop when idle) plus desktop-agent tokens at `GOD_INPUT_USD_PER_MTK` / `GOD_OUTPUT_USD_PER_MTK`. Live model/voice: `GOD_LIVE_MODEL` (default `gpt-live-1`), `GOD_LIVE_VOICE` (default `marin`). Realtime fallback: `GOD_REALTIME_MODEL` (default `gpt-realtime-2.1`), `GOD_REALTIME_VOICE`.
 
-**Stop** / ⌘⇧. tears down Realtime and releases input. Grant Accessibility, Screen Recording, and Microphone.
+**Stop** / ⌘⇧. closes the voice session and releases input. Grant Accessibility, Screen Recording, and Microphone.
 
-Docs: [SPEC.md](SPEC.md) · [SPEC-live.md](SPEC-live.md) · [SPEC-realtime.md](SPEC-realtime.md) · [CAPABILITY-MAP.md](CAPABILITY-MAP.md)
+Docs: [AGENTS.md](AGENTS.md) (start here) · [SPEC.md](SPEC.md) · [SPEC-live.md](SPEC-live.md) · [SPEC-realtime.md](SPEC-realtime.md) · [CAPABILITY-MAP.md](CAPABILITY-MAP.md)

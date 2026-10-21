@@ -1,5 +1,7 @@
 # Spec: realtime agent
 
+> **Status:** fallback only (`GOD_VOICE_BACKEND=realtime`). The default voice backend is GPT-Live ([SPEC-live.md](SPEC-live.md)).
+
 ## Objective
 
 God converses with full-duplex voice via the OpenAI Realtime API, hands **desktop control** to a background agent loop (so the mic stays usable mid-browse), pauses desktop work on human mouse move while a task is active, and narrates results when the desktop runner finishes.

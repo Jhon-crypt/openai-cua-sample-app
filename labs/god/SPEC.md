@@ -1,5 +1,7 @@
 # Spec: God (MVP)
 
+> **Status:** MVP shipped. This file is the original product spec; current architecture, protocol and pitfalls are in [AGENTS.md](AGENTS.md), voice wiring in [SPEC-live.md](SPEC-live.md).
+
 ## Objective
 
 Personal native Mac co-pilot: I open a session, speak goals and do’s/don’ts, and a Python worker drives the desktop while a Swift HUD shows transcript, narration, and a kill switch.
@@ -9,10 +11,10 @@ Personal native Mac co-pilot: I open a session, speak goals and do’s/don’ts,
 
 ## Tech Stack
 
-- macOS 14+, Swift 6, SwiftUI (app under `macos/`)
+- macOS 14+, SwiftUI (app under `macos/`), built with Swift ≥ 6.3.3
 - Python 3.10+ worker under `worker/` (PyAutoGUI; same permission model as `python-app`)
-- OpenAI APIs later for STT + agent (not slice 1)
-- JSON-lines protocol over the worker’s stdin/stdout
+- OpenAI: GPT-Live (`gpt-live-1`) for voice, Responses API for the desktop agent, Realtime API as fallback voice
+- JSON-lines protocol over the worker’s stdin/stdout (reference in [AGENTS.md](AGENTS.md))
 
 ## Commands
 
@@ -34,15 +36,15 @@ uv run --project labs/god/worker pytest
 
 ```text
 labs/god/
-  CAPABILITY-MAP.md
+  AGENTS.md              → start here (architecture, protocol, pitfalls, verify)
+  CAPABILITY-MAP.md      → module index; SPEC-<module>.md per module
   SPEC.md
   ideas/voice-mac-operator.md
   tasks/plan.md
   tasks/todo.md
-  SPEC-shell-hud.md
-  SPEC-desktop-worker.md
-  macos/                 → SwiftUI app (shell-hud)
-  worker/                → Python package god_worker (desktop-worker)
+  macos/                 → SwiftUI HUD (shell-hud)
+  worker/                → Python package god_worker (desktop-worker, live, agent-loop, realtime)
+  worker/scripts/        → live_probe.py (talk to GPT-Live without a mic)
 ```
 
 ## Code Style
@@ -65,11 +67,11 @@ labs/god/
 
 ## Success Criteria
 
-- [ ] `god_worker --check` reports permissions or a clear error
-- [ ] HUD builds and shows Session idle / listening / acting / stopped
-- [ ] Test Click performs one primary-display click via the worker
-- [ ] Stop (button or ⌘⇧.) asks worker to release keys/mouse and marks session stopped
-- [ ] Specs and capability map committed under `labs/god/`
+- [x] `god_worker --check` reports permissions or a clear error
+- [x] HUD builds and shows Session idle / listening / acting / stopped
+- [x] Test Click performs one primary-display click via the worker
+- [x] Stop (button or ⌘⇧.) asks worker to release keys/mouse and marks session stopped
+- [x] Specs and capability map committed under `labs/god/`
 
 ## Open Questions (defaults for now)
 
@@ -78,4 +80,4 @@ labs/god/
 | Wake | Hotkey / Start Session button only |
 | Stop hotkey | ⌘⇧. |
 | Remember spoken rules | Session only |
-| STT / model | Deferred to voice-session + agent-loop |
+| STT / model | GPT-Live (voice) + Responses (desktop agent) |

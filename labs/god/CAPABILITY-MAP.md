@@ -13,7 +13,7 @@
 | harness-plan | Persistent `update_plan` (desktop / agent-loop path) | agent-loop, gui-tools |
 | harness-context | T4-style elision + summary of bulky tool results | agent-loop |
 | harness-stuck | Repeated failing-tool streaks → remind / freeze | agent-loop |
-| voice-session | Continuous 24 kHz mic stream into Realtime; PCM playback | shell-hud, realtime |
+| voice-session | Continuous 24 kHz mic stream into the voice backend; PCM playback + mic ducking (HUD) | shell-hud, live |
 | session-log | Append-only event log for a session (local files) | shell-hud |
 
 **Build order:** `shell-hud` + `desktop-worker` → `gui-tools` / harness-* → `agent-loop` → `voice-tools-split` → `realtime` / `voice-session` → `session-log`
