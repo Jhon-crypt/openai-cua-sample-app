@@ -24,6 +24,47 @@ private final class AtomicBool: @unchecked Sendable {
     }
 }
 
+/// Laptop speakers have no echo cancellation, so while God is audible the mic hears God.
+/// Pass only mic audio clearly louder than that echo (the operator talking over God) so
+/// Live hears the interruption; everything else becomes silence.
+private final class BargeInGate: @unchecked Sendable {
+    private let lock = NSLock()
+    /// Running estimate of God's echo level in the mic (pcm RMS, 0…1). Measured ≈ 0.006 at normal volume.
+    private var echoLevel: Float = 0.006
+    private var openUntil = Date.distantPast
+
+    private static let minThreshold: Float = 0.025
+    private static let echoMultiple: Float = 4
+    /// Keep passing audio briefly after the last loud chunk so word endings aren't chopped.
+    private static let hangover: TimeInterval = 0.6
+
+    func filter(_ chunk: Data) -> Data {
+        let rms = Self.rms(chunk)
+        let now = Date()
+        lock.lock()
+        defer { lock.unlock() }
+        if rms >= max(Self.minThreshold, echoLevel * Self.echoMultiple) {
+            openUntil = now.addingTimeInterval(Self.hangover)
+        }
+        if now < openUntil { return chunk }
+        echoLevel = echoLevel * 0.95 + rms * 0.05
+        return Data(count: chunk.count)
+    }
+
+    private static func rms(_ chunk: Data) -> Float {
+        chunk.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            guard !samples.isEmpty else { return 0 }
+            var sum: Float = 0
+            for s in samples {
+                let v = Float(Int16(littleEndian: s)) / 32_768
+                sum += v * v
+            }
+            return (sum / Float(samples.count)).squareRoot()
+        }
+    }
+}
+
 @MainActor
 final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isSpeaking = false
@@ -47,8 +88,16 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         super.init()
     }
 
+    private let bargeIn = BargeInGate()
+
     nonisolated func shouldSuppressMic() -> Bool {
         suppressMic.get()
+    }
+
+    /// Mic chunk to send to the worker: unchanged unless God is audible on laptop speakers,
+    /// then silence except when the operator talks over God.
+    nonisolated func micChunkToSend(_ chunk: Data) -> Data {
+        suppressMic.get() ? bargeIn.filter(chunk) : chunk
     }
 
     nonisolated func isPlaybackActive() -> Bool {

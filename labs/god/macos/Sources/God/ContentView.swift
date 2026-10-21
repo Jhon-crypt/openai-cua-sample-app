@@ -137,7 +137,7 @@ struct ContentView: View {
 
     private var micStatusLabel: String {
         if audioProfile == "far_field" {
-            return "Mic live — muted while God talks (laptop speakers)."
+            return "Mic live — talk over God clearly to interrupt (laptop speakers)."
         }
         return "Mic live — speak naturally."
     }
@@ -241,8 +241,7 @@ struct ContentView: View {
         voice.onPCMChunk = { @Sendable data in
             // Live's transcript/delegation offsets are positions in the input stream: send
             // silence (not nothing) while ducked so the timeline stays continuous.
-            let chunk = player.shouldSuppressMic() ? Data(count: data.count) : data
-            ingress.sendPCMBase64(chunk.base64EncodedString())
+            ingress.sendPCMBase64(player.micChunkToSend(data).base64EncodedString())
         }
     }
 
